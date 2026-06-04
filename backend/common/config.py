@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     REFERENCE_PARSER_PROVIDER: str = "llm"
     GROBID_BASE_URL: str = "http://grobid:8070"
 
+    # MinerU KIE cloud SDK (mineru-kie-sdk)
+    MINERU_KIE_BASE_URL: str = "https://mineru.net/api/kie"
+    MINERU_PIPELINE_ID: str = ""          # required for cloud parsing
+    MINERU_API_KEY: str = ""              # reserved, used per SDK auth
+    MINERU_POLL_INTERVAL: int = 5         # seconds between polls
+    MINERU_TIMEOUT: int = 300             # total poll timeout (s); -1 = until done
+
     # Retrieval
     RETRIEVAL_TOP_K: int = 20
     HYBRID_DENSE_WEIGHT: float = 0.6

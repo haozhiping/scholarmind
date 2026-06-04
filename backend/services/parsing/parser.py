@@ -137,18 +137,39 @@ def _find_block_list(obj: Any) -> list[dict]:
 # Step 1: MinerU parsing
 # ---------------------------------------------------------------------------
 
-async def _call_mineru(pdf_key: str) -> list[dict]:
-    """
-    Call MinerU HTTP API to parse a PDF stored in MinIO.
-    Returns a list of block dicts from MinerU's response.
-    Falls back to empty list on failure (worker will mark task failed upstream).
-    """
-    url = f"{settings.MINERU_BASE_URL}/parse"
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(url, json={"pdf_key": pdf_key})
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("blocks", [])
+def _sync_mineru_call(pdf_bytes: bytes) -> dict:
+    """Blocking MinerU KIE call. Wrapped by _call_mineru via asyncio.to_thread."""
+    import os
+    import tempfile
+    from mineru_kie_sdk import MineruKIEClient
+
+    client = MineruKIEClient(
+        base_url=settings.MINERU_KIE_BASE_URL,
+        pipeline_id=settings.MINERU_PIPELINE_ID,
+        timeout=30,
+    )
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+        client.upload_file(tmp_path)
+        results = client.get_result(
+            timeout=settings.MINERU_TIMEOUT,
+            poll_interval=settings.MINERU_POLL_INTERVAL,
+        )
+        parse = results.get("parse") if isinstance(results, dict) else None
+        if parse is not None and hasattr(parse, "get_result"):
+            parse = parse.get_result()
+        return parse or {}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+async def _call_mineru(pdf_bytes: bytes) -> dict:
+    """Async wrapper: run the blocking SDK in a thread to keep the loop free."""
+    return await asyncio.to_thread(_sync_mineru_call, pdf_bytes)
 
 
 def _mineru_to_blocks(parse_result: dict) -> list[Block]:

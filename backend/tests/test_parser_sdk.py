@@ -128,3 +128,52 @@ def test_upload_figures_skips_when_no_raw_image(monkeypatch):
     blocks = [Block(block_type="figure", content="cap", image_key="x/y/z.png", block_id=1)]
     asyncio.run(parser._upload_figures(user_id=5, paper_id=2, blocks=blocks, db=db))
     fake_client.put_object.assert_not_called()
+
+
+def test_parse_paper_end_to_end(monkeypatch):
+    from services.parsing import parser
+
+    parse_result = {"blocks": [
+        {"type": "text", "content": "Hello", "page_idx": 0},
+        {"type": "figure", "image": b"PNG", "caption": "Fig", "page_idx": 0},
+    ]}
+
+    async def fake_call_mineru(pdf_bytes):
+        return parse_result
+
+    async def fake_upload_figures(user_id, paper_id, blocks, db):
+        return None
+
+    async def fake_describe(blocks):
+        return None
+
+    async def fake_refs(blocks):
+        return [{"title": "Ref A", "authors": ["X"], "year": 2020, "raw_ref": "X 2020"}]
+
+    monkeypatch.setattr(parser, "_call_mineru", fake_call_mineru)
+    monkeypatch.setattr(parser, "_upload_figures", fake_upload_figures)
+    monkeypatch.setattr(parser, "_describe_figures", fake_describe)
+    monkeypatch.setattr(parser, "_extract_refs_llm", fake_refs)
+
+    db = AsyncMock()
+    db.execute.return_value = MagicMock(lastrowid=1)
+
+    result = asyncio.run(parser.parse_paper(
+        user_id=5, paper_id=2, pdf_key="5/2/original.pdf", db=db, pdf_bytes=b"%PDF",
+    ))
+
+    assert len(result.blocks) == 2
+    assert result.references[0]["title"] == "Ref A"
+    db.commit.assert_awaited()
+    # papers status update executed (look for an UPDATE papers ... done call)
+    sql_calls = " ".join(str(c.args[0]) for c in db.execute.await_args_list)
+    assert "UPDATE papers" in sql_calls
+
+
+def test_parse_paper_requires_pdf_bytes_for_sdk():
+    from services.parsing import parser
+    db = AsyncMock()
+    with pytest.raises(ValueError):
+        asyncio.run(parser.parse_paper(
+            user_id=5, paper_id=2, pdf_key="k", db=db, pdf_bytes=None,
+        ))

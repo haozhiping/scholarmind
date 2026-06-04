@@ -328,40 +328,48 @@ async def parse_paper(
     pdf_key: str,
     db: AsyncSession,
     *,
-    pdf_bytes: bytes | None = None,  # required only for grobid mode
+    pdf_bytes: bytes | None = None,  # required for MinerU KIE SDK
 ) -> ParseResult:
     """
     Full parse pipeline for one paper. Called from RQ worker (not request thread).
-    Writes doc_blocks and citations to DB, returns ParseResult for indexing.
+    Writes doc_blocks/citations, uploads figures, updates papers.status, returns ParseResult.
     """
-    logger.info(f"[parse] paper_id={paper_id} user_id={user_id} provider={settings.REFERENCE_PARSER_PROVIDER}")
+    logger.info(
+        f"[parse] paper_id={paper_id} user_id={user_id} "
+        f"provider={settings.REFERENCE_PARSER_PROVIDER}"
+    )
 
-    # --- Step 1: MinerU ---
-    raw_blocks = await _call_mineru(pdf_key)
-    blocks = _mineru_to_blocks(raw_blocks)
+    if pdf_bytes is None:
+        logger.warning("[parse] MinerU KIE SDK requires pdf_bytes; none provided")
+        raise ValueError("pdf_bytes is required for MinerU KIE parsing")
+
+    # --- Step 1: MinerU (blocking SDK wrapped in a thread) ---
+    parse_result = await _call_mineru(pdf_bytes)
+    blocks = _mineru_to_blocks(parse_result)
     logger.info(f"[parse] MinerU returned {len(blocks)} blocks")
 
-    # --- Step 2: VLM figure descriptions (concurrent with next steps) ---
-    vlm_task = asyncio.create_task(_describe_figures(blocks))
+    # --- Step 2: write blocks first to obtain block_id (needed for figure keys) ---
+    await _write_blocks(user_id, paper_id, blocks, db)
 
-    # --- Step 3: Reference extraction ---
-    if settings.REFERENCE_PARSER_PROVIDER == "grobid":
-        if pdf_bytes is None:
-            logger.warning("[parse] grobid mode requires pdf_bytes, falling back to llm")
-            references = await _extract_refs_llm(blocks)
-        else:
-            references = await _extract_refs_grobid(pdf_bytes)
+    # --- Step 3: upload figures to MinIO and backfill image_key ---
+    await _upload_figures(user_id, paper_id, blocks, db)
+
+    # --- Step 4: VLM descriptions (needs image_key set) ---
+    await _describe_figures(blocks)
+
+    # --- Step 5: reference extraction ---
+    if settings.REFERENCE_PARSER_PROVIDER == "grobid" and pdf_bytes is not None:
+        references = await _extract_refs_grobid(pdf_bytes)
     else:
         references = await _extract_refs_llm(blocks)
-
-    # Wait for VLM to finish
-    await vlm_task
-
     logger.info(f"[parse] extracted {len(references)} references")
-
-    # --- Step 4: Write to DB ---
-    await _write_blocks(user_id, paper_id, blocks, db)
     await _write_citations(paper_id, references, db)
+
+    # --- Step 6: mark paper done ---
+    await db.execute(
+        text("UPDATE papers SET status='done' WHERE id=:pid AND user_id=:uid"),
+        {"pid": paper_id, "uid": user_id},
+    )
     await db.commit()
 
     return ParseResult(

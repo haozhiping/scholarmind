@@ -12,6 +12,9 @@
 - [事实] **HNSW 是 ANN，不是全库扫** —— 分区内几百万向量也是亚线性图搜索，速度不是瓶颈；相关性收窄靠 `paper_id/folder_id/acl` scalar 过滤 + 大范围时两阶段文档路由，不是靠分区。
 - [坑] **大表别塞一个 chunk** —— 一张大表→一个向量语义被稀释。走小-大检索：摘要入库，命中后按 `block_id` 取 `doc_blocks` 整表喂 LLM。
 - [坑] **批量上传别用 BackgroundTasks** —— 进程重启任务丢、不能限并发。用 RQ：状态进 `ingest_tasks`，可关页面、可重试、可恢复。
+- [坑] **MinerU 是云端 KIE SDK（mineru-kie-sdk），非本地容器** —— 用 `MineruKIEClient(base_url=MINERU_KIE_BASE_URL, pipeline_id=...)` 连 mineru.net，与配置里的 `MINERU_BASE_URL`(本地容器 HTTP) 不是一回事。SDK 同步阻塞(requests)，async 里必须 `asyncio.to_thread` 包裹；上传收文件路径，需先落 tempfile。其 parse 返回结构未文档化，`_mineru_to_blocks` 用容错适配层（字段映射假设见 `check/任务1-解析服务对接-验证报告.md`），真实联调需核对。
+- [坑] **图片落 MinIO 依赖先写库拿 block_id** —— figures key=`{user_id}/{paper_id}/{block_id}.png`，block_id 是 doc_blocks 自增。顺序必须：先 `_write_blocks`(回收 lastrowid) → 传图 → UPDATE 回填 image_key。`parse_paper` SDK 模式强制要求 `pdf_bytes`(缺失抛 ValueError)，未来 worker 负责从 MinIO 取字节传入。
+
 
 ## 设计决策
 

@@ -213,9 +213,9 @@ async def _describe_figures(blocks: list[Block]) -> None:
 
     async def _describe(block: Block) -> None:
         try:
-            # Build a presigned/public URL — MinIO endpoint is accessible from backend container
-            image_url = (
-                f"http://{settings.MINIO_ENDPOINT}/{settings.MINIO_BUCKET_FIG}/{block.image_key}"
+            client = _minio_client()
+            image_url = await asyncio.to_thread(
+                _sync_presigned, client, settings.MINIO_BUCKET_FIG, block.image_key
             )
             block.content_zh = await vlm_describe_image(image_url, caption=block.content)
         except Exception as e:
@@ -373,13 +373,69 @@ async def parse_paper(
 
 
 # ---------------------------------------------------------------------------
+# MinIO figure upload (minimal in-parser client; full client is out of scope)
+# ---------------------------------------------------------------------------
+
+def _minio_client():
+    from minio import Minio
+    return Minio(
+        settings.MINIO_ENDPOINT,
+        access_key=settings.MINIO_ACCESS_KEY,
+        secret_key=settings.MINIO_SECRET_KEY,
+        secure=settings.MINIO_SECURE,
+    )
+
+
+def _decode_image(raw: Any) -> bytes:
+    """Accept raw bytes or (data-URI) base64 string, return PNG bytes."""
+    if isinstance(raw, bytes):
+        return raw
+    if isinstance(raw, str):
+        import base64
+        payload = raw.split(",", 1)[-1]  # strip optional data: URI prefix
+        return base64.b64decode(payload)
+    raise ValueError(f"unsupported image payload type: {type(raw)!r}")
+
+
+def _sync_put_object(client, bucket: str, key: str, data: bytes) -> None:
+    from io import BytesIO
+    if not client.bucket_exists(bucket):
+        client.make_bucket(bucket)
+    client.put_object(bucket, key, BytesIO(data), length=len(data), content_type="image/png")
+
+
+def _sync_presigned(client, bucket: str, key: str) -> str:
+    return client.presigned_get_object(bucket, key)
+
+
+async def _upload_figures(user_id: int, paper_id: int, blocks: list[Block], db: AsyncSession) -> None:
+    """Upload figure images to MinIO and backfill image_key. Needs block_id set first."""
+    targets = [b for b in blocks if b.block_type == "figure" and b.raw_image and b.block_id]
+    if not targets:
+        return
+    client = _minio_client()
+    bucket = settings.MINIO_BUCKET_FIG
+    for b in targets:
+        try:
+            data = _decode_image(b.raw_image)
+            key = f"{user_id}/{paper_id}/{b.block_id}.png"
+            await asyncio.to_thread(_sync_put_object, client, bucket, key, data)
+            b.image_key = key
+            await db.execute(
+                text("UPDATE doc_blocks SET image_key=:k WHERE id=:id AND user_id=:uid"),
+                {"k": key, "id": b.block_id, "uid": user_id},
+            )
+        except Exception as e:
+            logger.warning(f"[parse] figure upload failed block_id={b.block_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # DB writes
 # ---------------------------------------------------------------------------
 
 async def _write_blocks(user_id: int, paper_id: int, blocks: list[Block], db: AsyncSession) -> None:
-    from sqlalchemy import text
     for b in blocks:
-        await db.execute(
+        result = await db.execute(
             text("""
                 INSERT INTO doc_blocks (paper_id, user_id, block_type, content, page_num, bbox, image_key)
                 VALUES (:paper_id, :user_id, :block_type, :content, :page_num, :bbox, :image_key)
@@ -394,6 +450,7 @@ async def _write_blocks(user_id: int, paper_id: int, blocks: list[Block], db: As
                 "image_key": b.image_key,
             },
         )
+        b.block_id = result.lastrowid
 
 
 async def _write_citations(paper_id: int, references: list[dict], db: AsyncSession) -> None:

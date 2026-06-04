@@ -74,3 +74,57 @@ def test_call_mineru_propagates_errors():
     with pytest.raises(TimeoutError):
         asyncio.run(parser._call_mineru(b"x"))
     del sys.modules["mineru_kie_sdk"]
+
+
+from unittest.mock import AsyncMock, MagicMock
+from services.parsing.parser import Block
+
+
+def test_decode_image_bytes_and_base64():
+    from services.parsing import parser
+    assert parser._decode_image(b"raw") == b"raw"
+    import base64
+    b64 = base64.b64encode(b"hello").decode()
+    assert parser._decode_image(b64) == b"hello"
+    # data URI prefix tolerated
+    assert parser._decode_image("data:image/png;base64," + b64) == b"hello"
+
+
+def test_write_blocks_fills_block_id():
+    from services.parsing import parser
+    db = AsyncMock()
+    db.execute.return_value = MagicMock(lastrowid=42)
+    blocks = [Block(block_type="text", content="a")]
+    asyncio.run(parser._write_blocks(7, 3, blocks, db))
+    assert blocks[0].block_id == 42
+    assert db.execute.await_count == 1
+
+
+def test_upload_figures_uploads_and_backfills(monkeypatch):
+    from services.parsing import parser
+
+    fake_client = MagicMock()
+    fake_client.bucket_exists.return_value = True
+    monkeypatch.setattr(parser, "_minio_client", lambda: fake_client)
+
+    db = AsyncMock()
+    blocks = [Block(block_type="figure", content="cap", raw_image=b"PNG", block_id=9)]
+    asyncio.run(parser._upload_figures(user_id=5, paper_id=2, blocks=blocks, db=db))
+
+    assert blocks[0].image_key == "5/2/9.png"
+    # put_object called with the computed key
+    args, kwargs = fake_client.put_object.call_args
+    assert args[0] == parser.settings.MINIO_BUCKET_FIG
+    assert args[1] == "5/2/9.png"
+    # UPDATE doc_blocks executed
+    assert db.execute.await_count == 1
+
+
+def test_upload_figures_skips_when_no_raw_image(monkeypatch):
+    from services.parsing import parser
+    fake_client = MagicMock()
+    monkeypatch.setattr(parser, "_minio_client", lambda: fake_client)
+    db = AsyncMock()
+    blocks = [Block(block_type="figure", content="cap", image_key="x/y/z.png", block_id=1)]
+    asyncio.run(parser._upload_figures(user_id=5, paper_id=2, blocks=blocks, db=db))
+    fake_client.put_object.assert_not_called()

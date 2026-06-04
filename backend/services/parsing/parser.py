@@ -151,16 +151,31 @@ async def _call_mineru(pdf_key: str) -> list[dict]:
         return data.get("blocks", [])
 
 
-def _mineru_to_blocks(raw_blocks: list[dict]) -> list[Block]:
+def _mineru_to_blocks(parse_result: dict) -> list[Block]:
+    """Normalize MinerU parse result into Block list. Tolerant of unknown shapes."""
+    raw_blocks = _find_block_list(parse_result)
+    if not raw_blocks:
+        logger.warning("[parse] no block list found in MinerU parse result")
+        return []
+
     blocks: list[Block] = []
     for rb in raw_blocks:
-        btype = rb.get("type", "text")
+        if not isinstance(rb, dict):
+            continue
+        btype = _norm_type(_pick(rb, "type", "block_type", "category"))
+        content = _pick(
+            rb, "content", "text", "html", "table_body", "latex", "markdown", "caption",
+            default="",
+        )
+        if isinstance(content, (dict, list)):
+            content = json.dumps(content, ensure_ascii=False)
         blocks.append(Block(
             block_type=btype,
-            content=rb.get("content", ""),
-            page_num=rb.get("page_num"),
-            bbox=rb.get("bbox"),
-            image_key=rb.get("image_key"),  # MinerU uploads figures to MinIO and returns key
+            content=str(content),
+            page_num=_extract_page(rb),
+            bbox=_pick(rb, "bbox", "box", "poly"),
+            image_key=_pick(rb, "image_key", "image_url", "img_path", "image_path"),
+            raw_image=rb.get("image") or rb.get("image_base64"),
         ))
     return blocks
 

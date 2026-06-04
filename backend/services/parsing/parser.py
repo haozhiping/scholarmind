@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 
 from common.clients.llm import chat_complete_json, vlm_describe_image
 from common.config import settings
@@ -38,6 +39,8 @@ class Block:
     bbox: list | None = None
     image_key: str | None = None  # MinIO key (figures only)
     content_zh: str = ""          # VLM description (figures) or empty
+    block_id: int | None = None   # MySQL doc_blocks.id, filled after insert
+    raw_image: Any = None         # raw bytes / base64 str from MinerU, pre-upload
 
 @dataclass
 class ParseResult:
@@ -57,6 +60,77 @@ def _load_prompt(name: str) -> str:
     text = path.read_text(encoding="utf-8")
     match = re.search(r"```\s*\n(.*?)\n```", text, re.DOTALL)
     return match.group(1) if match else text
+
+
+# ---------------------------------------------------------------------------
+# Normalization helpers (MinerU output is loosely specified — be tolerant)
+# ---------------------------------------------------------------------------
+
+_FIGURE_TYPES = {"image", "img", "figure", "fig", "picture"}
+_FORMULA_TYPES = {"equation", "formula", "latex", "math", "interline_equation", "inline_equation"}
+
+
+def _norm_type(raw: str | None) -> str:
+    """Map MinerU block type aliases onto our 4 canonical types."""
+    t = (raw or "").strip().lower()
+    if t in _FIGURE_TYPES:
+        return "figure"
+    if t in _FORMULA_TYPES:
+        return "formula"
+    if t == "table":
+        return "table"
+    return "text"
+
+
+def _pick(d: dict, *keys: str, default: Any = None) -> Any:
+    """Return the first non-empty value among keys."""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return default
+
+
+def _extract_page(rb: dict) -> int | None:
+    """Extract a 1-based page number, normalizing page_idx (0-based)."""
+    for k in ("page_num", "page_no", "page"):
+        v = rb.get(k)
+        if isinstance(v, int):
+            return v
+    idx = rb.get("page_idx")
+    if isinstance(idx, int):
+        return idx + 1
+    return None
+
+
+def _find_block_list(obj: Any) -> list[dict]:
+    """Recursively locate the list of block dicts in MinerU's parse result."""
+    if isinstance(obj, dict):
+        for key in ("blocks", "items", "elements", "content_list", "para_blocks"):
+            v = obj.get(key)
+            if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                return v
+        pages = obj.get("pages")
+        if isinstance(pages, list):
+            agg: list[dict] = []
+            for p in pages:
+                agg.extend(_find_block_list(p))
+            if agg:
+                return agg
+        for v in obj.values():
+            found = _find_block_list(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        if obj and all(isinstance(x, dict) for x in obj) and any(
+            ("type" in x or "content" in x or "text" in x) for x in obj
+        ):
+            return obj
+        for v in obj:
+            found = _find_block_list(v)
+            if found:
+                return found
+    return []
 
 
 # ---------------------------------------------------------------------------

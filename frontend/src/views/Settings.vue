@@ -168,9 +168,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive } from 'vue';
+import { ref, reactive, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import { settingsAPI } from '../api';
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -197,6 +198,20 @@ const config = reactive({
   HYBRID_DENSE_WEIGHT: 0.6,
 });
 
+onMounted(async () => {
+  // Could load saved settings from backend here
+  // await loadSettings();
+});
+
+async function loadSettings() {
+  try {
+    // In real scenario: const res = await settingsAPI.getSettings();
+    // For now, use default config
+  } catch (error: any) {
+    console.error('Failed to load settings:', error);
+  }
+}
+
 function handleLogout() {
   authStore.clearAuth();
   router.push('/login');
@@ -204,11 +219,15 @@ function handleLogout() {
 
 async function saveSettings() {
   saving.value = true;
-  // Simulate API save
-  setTimeout(() => {
-    saving.value = false;
+  try {
+    await settingsAPI.saveSettings(config);
     alert('全局 RAG 策略与模型参数已保存，修改即刻对后续查询生效！');
-  }, 800);
+  } catch (error: any) {
+    console.error('Failed to save settings:', error);
+    alert('保存失败，请稍后重试');
+  } finally {
+    saving.value = false;
+  }
 }
 </script>
 

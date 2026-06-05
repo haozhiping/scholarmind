@@ -32,13 +32,13 @@ Base: `http://localhost:8000`  ｜  鉴权: `Authorization: Bearer <jwt>`（除 
 | POST | `/api/chat/conversations` | 新建会话 |
 | GET  | `/api/chat/conversations` | 会话列表 |
 | GET  | `/api/chat/conversations/{id}/messages` | 历史消息 |
-| POST | `/api/chat/query` | **提问 (SSE 流式)**，body: question/conversation_id/scope(folder_id\|paper_ids) |
+| GET  | `/api/chat/query` | **提问 (SSE 流式)**，query: `conversation_id`/`question`/`scope_type`/`scope_ids`。必须 GET：前端用 EventSource(仅支持 GET) |
 | POST | `/api/chat/feedback` | 答案点赞/踩 |
 
 ## 进阶 advanced
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/review/generate` | Agentic 文献综述 (SSE)，body: topic/scope |
+| GET  | `/api/review/generate` | Agentic 文献综述 (SSE)，query: `topic`/`scope_type`/`scope_ids`。同 chat/query，SSE 走 GET |
 | GET  | `/api/graph/citations?paper_id=` | 引用图谱 (节点+边) |
 
 ## 可观测 observability
@@ -47,6 +47,12 @@ Base: `http://localhost:8000`  ｜  鉴权: `Authorization: Bearer <jwt>`（除 
 | GET | `/api/logs/queries` | 查询日志 (分页) |
 | GET | `/api/logs/access` | 访问日志 |
 | GET | `/api/stats/overview` | 论文数/chunk数/查询量/平均延迟 |
+
+## 设置 settings
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET  | `/api/settings` | 读取当前用户全局配置 (未保存返回 `{}`) |
+| POST | `/api/settings` | 保存 RAG 开关/模型/检索超参 (按 user_id 存 Redis) |
 
 ## SSE 事件格式
 ```

@@ -95,8 +95,8 @@ async def list_messages(id: int):
         return MOCK_MESSAGES[id]
     return []
 
-@router.post("/query",
-             summary="论文问答（SSE 流式）",
+@router.get("/query",
+            summary="论文问答（SSE 流式）",
              description="""向已入库的论文提问，SSE 流式返回答案和引用。
 
 **流程**：意图路由 → 查询改写+翻译+HyDE → 混合检索（dense+sparse）→ RRF 融合 → Reranker 重排 → LLM 生成带角标答案
@@ -107,7 +107,14 @@ async def list_messages(id: int):
 - `event: done` — 结束，含 latency_ms
 
 **scope_type**：`all`=全库，`folder`=指定文件夹，`papers`=指定论文列表""")
-async def chat_query(request: ChatQueryRequest):
+async def chat_query(
+    conversation_id: int,
+    question: str,
+    scope_type: str = "all",
+    scope_ids: Optional[str] = None,
+):
+    # SSE 必须经 GET 暴露：前端用 EventSource(只支持 GET)。参数走 query string，
+    # 与 frontend chatAPI.getQuerySSEUrl 构造的 URL 对齐。
     # Streaming Response Generator for SSE
     async def sse_generator():
         tokens = [
@@ -156,23 +163,23 @@ async def chat_query(request: ChatQueryRequest):
         yield "event: done\ndata: {\"latency_ms\": 652}\n\n"
 
     # Add the query to history mock database
-    if request.conversation_id in MOCK_MESSAGES:
+    if conversation_id in MOCK_MESSAGES:
         # Mocking user message adding
         user_msg = MessageResponse(
             id=int(datetime.now().timestamp() * 1000),
-            conversation_id=request.conversation_id,
+            conversation_id=conversation_id,
             role="user",
-            content=request.question,
+            content=question,
             citations=[],
             created_at=datetime.now()
         )
-        MOCK_MESSAGES[request.conversation_id].append(user_msg)
+        MOCK_MESSAGES[conversation_id].append(user_msg)
         
         # Mocking assistant message adding (will be complete after stream)
         assistant_content = "根据先前有关 RAG 的研究 Attention Is All You Need [1] 中提出的 Transformer 架构，多头注意力机制大大增强了序列特征的建模能力。对于多文档及复杂对比任务，通常结合混合检索 [2] 能够召回更精准的信息。"
         assistant_msg = MessageResponse(
             id=int(datetime.now().timestamp() * 1000) + 1,
-            conversation_id=request.conversation_id,
+            conversation_id=conversation_id,
             role="assistant",
             content=assistant_content,
             citations=[
@@ -197,7 +204,7 @@ async def chat_query(request: ChatQueryRequest):
             ],
             created_at=datetime.now()
         )
-        MOCK_MESSAGES[request.conversation_id].append(assistant_msg)
+        MOCK_MESSAGES[conversation_id].append(assistant_msg)
 
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
 

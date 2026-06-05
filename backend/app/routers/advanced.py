@@ -7,8 +7,8 @@ from app.schemas.advanced import ReviewGenerateRequest, CitationGraphResponse, C
 
 router = APIRouter(tags=["advanced"])
 
-@router.post("/review/generate",
-             summary="Agentic 文献综述生成（SSE 流式）",
+@router.get("/review/generate",
+            summary="Agentic 文献综述生成（SSE 流式）",
              description="""基于 LlamaIndex ReActAgent 自动生成多文献综述。
 
 **流程**：Agent 将 topic 分解为 3-5 个子问题 → 对每个子问题调用混合检索 → 汇总生成结构化综述（引言/核心挑战/方法对比/结论）
@@ -16,7 +16,12 @@ router = APIRouter(tags=["advanced"])
 **SSE 事件格式** 同 `/chat/query`：cite → token → done
 
 **scope_type**：`all`=全库，`folder`=指定文件夹，`papers`=指定论文列表""")
-async def generate_review(request: ReviewGenerateRequest):
+async def generate_review(
+    topic: str,
+    scope_type: str = "all",
+    scope_ids: Optional[str] = None,
+):
+    # SSE 经 GET 暴露(EventSource 仅支持 GET)，参数走 query string。
     # Streaming Response Generator for SSE review generation
     async def review_generator():
         sections = [

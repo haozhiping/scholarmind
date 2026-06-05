@@ -1,53 +1,57 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status
-from typing import List, Optional
-from datetime import datetime
+import json
 import uuid
-from app.schemas.papers import PaperResponse, PaperUploadResponse, PaperDetailResponse, FolderCreate, FolderResponse
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, File, Form, UploadFile, status
+
+from app.schemas.papers import (
+    FolderCreate, FolderResponse, PaperDetailResponse, PaperResponse, PaperUploadResponse,
+)
+from common.auth.deps import get_current_user
+from common.db.mysql_client import mysql
+from common.exceptions import NotFoundException
 
 router = APIRouter(prefix="/papers", tags=["papers"])
 folders_router = APIRouter(prefix="/folders", tags=["folders"])
 
-# Mock In-Memory Databases
-MOCK_FOLDERS = [
-    FolderResponse(id=1, name="大语言模型 (LLM)", parent_id=None, paper_count=2, created_at=datetime.now()),
-    FolderResponse(id=2, name="多模态与 VLM", parent_id=None, paper_count=0, created_at=datetime.now()),
-    FolderResponse(id=3, name="RAG 检索增强生成", parent_id=None, paper_count=3, created_at=datetime.now())
-]
 
-MOCK_PAPERS = [
-    PaperDetailResponse(
-        id=1,
-        title="Attention Is All You Need",
-        authors="Vaswani, Shazeer, Parmar, Uszkoreit, Jones, Gomez, Kaiser, Polosukhin",
-        journal="NeurIPS",
-        year=2017,
-        abstract="The dominant sequence transduction models are based on complex recurrent or convolutional neural networks...",
-        folder_id=1,
-        status="completed",
-        file_key="papers/attention_is_all_you_need.pdf",
-        file_size=220392,
-        pages=15,
-        created_at=datetime.now(),
-        batch_id="batch-782a-4bc3",
-        meta_data={"citations_count": 98000, "publisher": "Google"}
-    ),
-    PaperDetailResponse(
-        id=2,
-        title="Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
-        authors="Lewis, Perez, Piktus, Petroni, Karpukhin, Goyal, Küttler, Lewis, Yih, Riedel, Kiela",
-        journal="NeurIPS",
-        year=2020,
-        abstract="We show that hybrid retrieval-augmented models outperform traditional parametric-only language models...",
-        folder_id=3,
-        status="parsing",
-        file_key="papers/rag_nlp.pdf",
-        file_size=1049280,
-        pages=18,
-        created_at=datetime.now(),
-        batch_id="batch-591c-99d1",
-        meta_data={"citations_count": 3200, "publisher": "Meta AI"}
+# Map DB status (pending|done|failed) to the richer set the frontend renders.
+_STATUS_DISPLAY = {"done": "completed"}
+
+
+def _paper_row_to_response(row: Dict[str, Any]) -> PaperDetailResponse:
+    """Adapt a MySQL `papers` row to the API response contract.
+
+    DB stores authors as a JSON array and uses pdf_key/num_pages; the frontend
+    contract expects an authors string and file_key/pages. file_size is not
+    persisted (no column) → 0; journal/batch_id are not on papers → None.
+    """
+    authors = row.get("authors")
+    if isinstance(authors, str):
+        try:
+            authors = json.loads(authors)
+        except json.JSONDecodeError:
+            authors = None
+    authors_str = ", ".join(authors) if isinstance(authors, list) else (authors or None)
+
+    db_status = row.get("status") or "pending"
+    return PaperDetailResponse(
+        id=row["id"],
+        title=row["title"],
+        authors=authors_str,
+        journal=None,
+        year=row.get("year"),
+        abstract=row.get("abstract"),
+        folder_id=row.get("folder_id"),
+        status=_STATUS_DISPLAY.get(db_status, db_status),
+        file_key=row.get("pdf_key") or "",
+        file_size=0,
+        pages=row.get("num_pages") or 0,
+        created_at=row["created_at"],
+        batch_id=None,
+        meta_data={},
     )
-]
+
 
 # --- Papers Router Endpoints ---
 
@@ -56,69 +60,65 @@ MOCK_PAPERS = [
              description="上传一个或多个 PDF 文件，异步入库（202 立即返回）。返回 `batch_id` 和各文件对应的 `task_id`，通过 `/ingest/batches/{batch_id}` 轮询进度。")
 async def upload_papers(
     files: List[UploadFile] = File(...),
-    folder_id: Optional[int] = Form(None)
+    folder_id: Optional[int] = Form(None),
+    current=Depends(get_current_user),
 ):
+    # NOTE: 落 MinIO + 计算 file_hash + 写 papers/ingest_tasks + enqueue RQ
+    # 属于「上传→解析→入库」链路，将在下一轮实现。此处仅返回批次/任务标识，
+    # 保证前端上传交互不报错。
     batch_id = f"batch-{uuid.uuid4().hex[:8]}"
     task_ids = [f"task-{uuid.uuid4().hex[:12]}" for _ in files]
-    
-    # Save upload state into mock database (for list query)
-    for idx, f in enumerate(files):
-        new_paper = PaperDetailResponse(
-            id=len(MOCK_PAPERS) + 1,
-            title=f.filename.replace(".pdf", ""),
-            authors="待解析",
-            journal=None,
-            year=None,
-            abstract="排队解析中...",
-            folder_id=folder_id,
-            status="pending",
-            file_key=f"papers/{f.filename}",
-            file_size=123456,  # Mock size
-            pages=0,
-            created_at=datetime.now(),
-            batch_id=batch_id,
-            meta_data={}
-        )
-        MOCK_PAPERS.append(new_paper)
+    return PaperUploadResponse(batch_id=batch_id, tasks=task_ids)
 
-    return PaperUploadResponse(
-        batch_id=batch_id,
-        tasks=task_ids
-    )
 
 @router.get("", response_model=List[PaperResponse],
             summary="论文列表",
             description="获取当前用户的论文列表，支持按文件夹（`folder_id`）和解析状态（`pending/parsing/indexing/completed/failed`）过滤。")
 async def list_papers(
     folder_id: Optional[int] = None,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    current=Depends(get_current_user),
 ):
-    results = MOCK_PAPERS
+    sql = "SELECT * FROM papers WHERE user_id=%s"
+    args: List[Any] = [current["id"]]
     if folder_id is not None:
-        results = [p for p in results if p.folder_id == folder_id]
+        sql += " AND folder_id=%s"
+        args.append(folder_id)
     if status is not None:
-        results = [p for p in results if p.status == status]
-    return results
+        sql += " AND status=%s"
+        args.append(status)
+    sql += " ORDER BY created_at DESC"
+    rows = await mysql.fetchall(sql, *args)
+    return [_paper_row_to_response(r) for r in rows]
+
 
 @router.get("/{id}", response_model=PaperDetailResponse,
             summary="论文详情",
             description="获取单篇论文的完整信息，包含标题、作者、摘要、解析状态、MinIO 文件路径及附加元数据。")
-async def get_paper_detail(id: int):
-    for paper in MOCK_PAPERS:
-        if paper.id == id:
-            return paper
-    raise HTTPException(status_code=404, detail="Paper not found")
+async def get_paper_detail(id: int, current=Depends(get_current_user)):
+    row = await mysql.fetchone(
+        "SELECT * FROM papers WHERE id=%s AND user_id=%s", id, current["id"]
+    )
+    if not row:
+        raise NotFoundException("论文不存在")
+    return _paper_row_to_response(row)
+
 
 @router.delete("/{id}", status_code=status.HTTP_200_OK,
                summary="删除论文",
                description="删除指定论文，同步清理 MinIO 中的 PDF/图片文件及 Milvus 中对应的所有 chunk 向量。")
-async def delete_paper(id: int):
-    global MOCK_PAPERS
-    initial_len = len(MOCK_PAPERS)
-    MOCK_PAPERS = [p for p in MOCK_PAPERS if p.id != id]
-    if len(MOCK_PAPERS) < initial_len:
-        return {"status": "success", "message": f"Paper {id} has been deleted successfully."}
-    raise HTTPException(status_code=404, detail="Paper not found")
+async def delete_paper(id: int, current=Depends(get_current_user)):
+    deleted = await mysql.execute_rowcount(
+        "DELETE FROM papers WHERE id=%s AND user_id=%s", id, current["id"]
+    )
+    if deleted == 0:
+        raise NotFoundException("论文不存在")
+    # Clean up parent blocks (user-scoped). MinIO/Milvus cleanup is handled
+    # in the ingest link where those clients live.
+    await mysql.execute_rowcount(
+        "DELETE FROM doc_blocks WHERE paper_id=%s AND user_id=%s", id, current["id"]
+    )
+    return {"status": "success", "message": f"Paper {id} has been deleted successfully."}
 
 
 # --- Folders Router Endpoints ---
@@ -126,19 +126,61 @@ async def delete_paper(id: int):
 @folders_router.get("", response_model=List[FolderResponse],
                     summary="文件夹列表",
                     description="获取当前用户的所有文件夹及每个文件夹的论文数量。")
-async def list_folders():
-    return MOCK_FOLDERS
+async def list_folders(current=Depends(get_current_user)):
+    rows = await mysql.fetchall(
+        "SELECT f.id, f.name, f.parent_id, f.created_at, "
+        "COUNT(p.id) AS paper_count "
+        "FROM folders f "
+        "LEFT JOIN papers p ON p.folder_id = f.id AND p.user_id = %s "
+        "WHERE f.user_id = %s "
+        "GROUP BY f.id, f.name, f.parent_id, f.created_at "
+        "ORDER BY f.created_at ASC",
+        current["id"], current["id"],
+    )
+    return [
+        FolderResponse(
+            id=r["id"],
+            name=r["name"],
+            parent_id=r["parent_id"],
+            paper_count=int(r["paper_count"]),
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
 
 @folders_router.post("", response_model=FolderResponse, status_code=status.HTTP_201_CREATED,
                      summary="创建文件夹",
                      description="新建论文文件夹，支持嵌套（传 `parent_id`）。")
-async def create_folder(folder_data: FolderCreate):
-    new_folder = FolderResponse(
-        id=len(MOCK_FOLDERS) + 1,
-        name=folder_data.name,
-        parent_id=folder_data.parent_id,
-        paper_count=0,
-        created_at=datetime.now()
+async def create_folder(folder_data: FolderCreate, current=Depends(get_current_user)):
+    folder_id = await mysql.execute(
+        "INSERT INTO folders (user_id, name, parent_id) VALUES (%s, %s, %s)",
+        current["id"], folder_data.name, folder_data.parent_id,
     )
-    MOCK_FOLDERS.append(new_folder)
-    return new_folder
+    row = await mysql.fetchone(
+        "SELECT id, name, parent_id, created_at FROM folders WHERE id=%s", folder_id
+    )
+    return FolderResponse(
+        id=row["id"],
+        name=row["name"],
+        parent_id=row["parent_id"],
+        paper_count=0,
+        created_at=row["created_at"],
+    )
+
+
+@folders_router.delete("/{id}", status_code=status.HTTP_200_OK,
+                       summary="删除文件夹",
+                       description="删除指定文件夹；该文件夹下论文的 `folder_id` 置空（不删除论文本身）。")
+async def delete_folder(id: int, current=Depends(get_current_user)):
+    deleted = await mysql.execute_rowcount(
+        "DELETE FROM folders WHERE id=%s AND user_id=%s", id, current["id"]
+    )
+    if deleted == 0:
+        raise NotFoundException("文件夹不存在")
+    # Detach papers rather than orphaning their folder_id.
+    await mysql.execute_rowcount(
+        "UPDATE papers SET folder_id=NULL WHERE folder_id=%s AND user_id=%s",
+        id, current["id"],
+    )
+    return {"status": "success", "message": f"Folder {id} has been deleted successfully."}

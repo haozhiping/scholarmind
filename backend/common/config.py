@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     MILVUS_COLLECTION: str = "scholarmind_chunks"
     MILVUS_INDEX_TYPE: str = "HNSW"
     MILVUS_METRIC: str = "COSINE"
+    MILVUS_M: int = 16                    # HNSW M parameter
+    MILVUS_EF_CONSTRUCTION: int = 200     # ef during construction
+    MILVUS_EF_SEARCH: int = 64            # ef during search
+    MILVUS_BATCH_SIZE: int = 100          # bulk insert batch size
 
     # MySQL
     MYSQL_HOST: str = "mysql"

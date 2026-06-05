@@ -61,7 +61,7 @@ cd frontend && npm install && npm run dev
 
 ### 📁 任务 1：解析服务对接 (`backend/services/parsing`)
 - [ ] **MinerU API 对接**：在 `parsing` 逻辑中，使用已安装的 `mineru-kie-sdk` 中的 `MineruKIEClient`，上传 PDF，轮询获取双栏正文、公式 (LaTeX)、表格 (HTML) 和抠出的图。
-- [ ] **参考文献提取（LLM 方式）**：使用 LLM 配合 `prompts/extract_references.md` 提示词从论文文本中提取参考文献列表，写入 MySQL `citations` 表。（GROBID 方式精度更高但镜像 ~4GB，待后期按需启用：设 `REFERENCE_PARSER_PROVIDER=grobid` 并取消 docker-compose 中 grobid 容器注释）
+- [ ] **参考文献提取（LLM 方式）**：使用 LLM 配合 `prompts/extract_references.md` 提示词从论文文本中提取参考文献列表，写入 MySQL `citations` 表。
 - [ ] **VLM 图片描述**：将抠图上传至 MinIO `figures` bucket，调用 `qwen3-vl` (配合 `figure_caption.md` 提示词) 生成中文图像描述。
 - [ ] **数据归一化入库**：将 MinerU 解析出的全部 block 写入 MySQL `doc_blocks` 表，并更新 `papers` 状态。
 
@@ -76,12 +76,19 @@ cd frontend && npm install && npm run dev
 - [ ] **自适应过滤**：实现 Corrective RAG 对检索质量打分，决定是否重写检索或拒绝回答。对接 Redis 缓存层，对相似问题实现秒级返回。
 
 ### 📁 任务 4：对话与 Agent 综述 (`backend/services/chat_agent`)
-- [ ] **意图路由**：在 `chat_agent` 中使用 `intent_router` 提示词进行分类分流，过滤闲聊。
-- [ ] **多轮记忆**：连接 PostgreSQL `scholarmind_memory` 库，读取/保存会话历史 (`conversations`/`messages` 表)。
-- [ ] **Agent 综述生成**：使用 LlamaIndex Agent，接收复杂综述/对比请求，分解子查询并检索多篇论文，使用 `review_generation` 提示词输出带引用的综述。
-- [ ] **SSE 流式输出**：通过 FastAPI EventSourceResponse 流式推送生成的文本，并在引用处推送 `cite` 结构化事件。
+- [📋] **意图路由**：在 `chat_agent` 中使用 `intent_router` 提示词进行分类分流，过滤闲聊。
+- [📋] **多轮记忆**：连接 PostgreSQL `scholarmind_memory` 库，读取/保存会话历史 (`conversations`/`messages` 表)。
+- [📋] **Agent 综述生成**：使用 LlamaIndex Agent，接收复杂综述/对比请求，分解子查询并检索多篇论文，使用 `review_generation` 提示词输出带引用的综述。
+- [📋] **SSE 流式输出**：通过 FastAPI EventSourceResponse 流式推送生成的文本，并在引用处推送 `cite` 结构化事件。
+
+**已创建文件**：
+- `intent_router.py` - 意图分类路由
+- `chat_service.py` - 对话服务与SSE流式输出
+- `agent.py` - LlamaIndex Agent综述生成
+- `schemas.py` - Pydantic数据模型
+- `prompts.py` - 提示词模板（intent_router、review_generation等）
 
 ### 📁 任务 5：前端页面与 API 联调 (`frontend/src`)
-- [ ] **接口联调**：将各页面的 Mock 方法替换为真实的 Axios 请求（如注册/登录、文献上传进度轮询、设置保存）。
-- [ ] **流式对话与引用溯源**：在 `Chat.vue` 中解析 SSE 事件流，实时渲染文本。点击 `[n]` 角标或底部引用卡片时，向右侧 Preview 区域传递并渲染出对应的段落原文、HTML 表格或者插图图片。
-- [ ] **可观测可视化**：在 `Observability.vue` 中获取并展示真实的导入进度 and Query 历史日志。
+- [x] **接口联调**：将各页面的 Mock 方法替换为真实的 Axios 请求（如注册/登录、文献上传进度轮询、设置保存）。
+- [x] **流式对话与引用溯源**：在 `Chat.vue` 中解析 SSE 事件流，实时渲染文本。点击 `[n]` 角标或底部引用卡片时，向右侧 Preview 区域传递并渲染出对应的段落原文、HTML 表格或者插图图片。
+- [x] **可观测可视化**：在 `Observability.vue` 中获取并展示真实的导入进度 and Query 历史日志。

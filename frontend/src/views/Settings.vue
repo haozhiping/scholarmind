@@ -199,14 +199,15 @@ const config = reactive({
 });
 
 onMounted(async () => {
-  // Could load saved settings from backend here
-  // await loadSettings();
+  await loadSettings();
 });
 
 async function loadSettings() {
   try {
-    // In real scenario: const res = await settingsAPI.getSettings();
-    // For now, use default config
+    const res = await settingsAPI.getSettings();
+    if (res.data && Object.keys(res.data).length > 0) {
+      Object.assign(config, res.data);
+    }
   } catch (error: any) {
     console.error('Failed to load settings:', error);
   }

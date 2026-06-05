@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from datetime import datetime
@@ -12,6 +13,7 @@ from .agent import ReviewAgent
 from ..retrieval.retriever import HybridRetriever
 from ...common.db.pg_client import AsyncPGClient
 from ...common.db.redis_client import AsyncRedisClient
+from ...common.db.mysql_client import mysql
 from ...common.clients.llm import AsyncLLMClient
 from ...common.exceptions import (
     DatabaseException, 
@@ -141,45 +143,93 @@ class ChatService:
         except Exception as e:
             logger.warning(f"Failed to update cache: {e}")
 
-    async def query(self, request: ChatRequest) -> AsyncGenerator[str, None]:
+    async def query(
+        self, request: ChatRequest, user_id: str = ""
+    ) -> AsyncGenerator[str, None]:
         conv_id = request.conv_id or str(uuid.uuid4())
+        t0 = time.perf_counter()
+        full_response = ""
+        citations: List[Dict[str, Any]] = []
+        chunk_ids: List[str] = []
+        intent_type = ""
         logger.info(f"Processing query: conv_id={conv_id}, query={request.query[:50]}...")
-        
+
+        # tiny helper: accumulate token/cite from a JSON-line chunk
+        def _accum(line: str):
+            nonlocal full_response
+            try:
+                obj = json.loads(line)
+                etype = obj.get("event", "")
+                if etype == "token":
+                    full_response += obj.get("data", {}).get("content", "")
+                elif etype == "cite":
+                    citations.append(obj.get("data", {}))
+                    cid = obj.get("data", {}).get("chunk_id")
+                    if cid:
+                        chunk_ids.append(cid)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         try:
             if not request.conv_id:
                 await self.create_conversation()
-            
+
             await self.add_message(conv_id, "user", request.query)
-            
+
             history = await self.get_history(conv_id)
-            
+
             intent_result = await self.intent_router.route_intent(request.query, history)
             intent_type = intent_result["intent_type"]
             logger.info(f"Intent classified: {intent_type}")
-            
+
             if intent_type == "chitchat":
                 async for chunk in self._handle_chitchat(request.query):
+                    _accum(chunk)
                     yield chunk
             elif intent_type == "knowledge":
                 async for chunk in self._handle_knowledge(request.query, history, conv_id):
+                    _accum(chunk)
                     yield chunk
             elif intent_type == "complex":
                 async for chunk in self._handle_complex(request.query, history, conv_id):
+                    _accum(chunk)
                     yield chunk
             elif intent_type == "followup":
                 async for chunk in self._handle_followup(request.query, history, conv_id):
+                    _accum(chunk)
                     yield chunk
             else:
                 logger.warning(f"Unknown intent type: {intent_type}")
                 yield json.dumps({"event": "error", "data": {"message": "Unknown intent type"}})
-            
-            await self.add_message(conv_id, "assistant", "", {"intent_type": intent_type})
-            logger.info(f"Query completed: conv_id={conv_id}, intent={intent_type}")
-            
+
+            # ---- persistent write AFTER streaming is complete ----
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+
+            meta: Dict[str, Any] = {"intent_type": intent_type}
+            if citations:
+                meta["citations"] = citations
+
+            await self.add_message(
+                conv_id, "assistant", full_response, meta,
+            )
+
+            await self._log_query(
+                user_id=user_id,
+                question=request.query,
+                intent_type=intent_type,
+                chunk_ids=chunk_ids,
+                latency_ms=latency_ms,
+            )
+
+            logger.info(
+                f"Query completed: conv_id={conv_id}, intent={intent_type}, "
+                f"len={len(full_response)}, latency={latency_ms}ms"
+            )
+
         except Exception as e:
             logger.error(f"Error processing query: conv_id={conv_id}, error={e}")
             yield json.dumps({
-                "event": "error", 
+                "event": "error",
                 "data": {"message": str(e), "conv_id": conv_id}
             })
 
@@ -306,6 +356,122 @@ class ChatService:
         except Exception as e:
             logger.error(f"Failed to get conversation: conv_id={conv_id}, error={e}")
             raise DatabaseException(f"Failed to get conversation: {e}")
+
+    async def get_messages(self, conv_id: str) -> List[Dict[str, Any]]:
+        """Return all messages for a conversation (for the REST endpoint)."""
+        try:
+            rows = await self.pg_client.fetch(
+                """
+                SELECT msg_id, conv_id, role, content, metadata, created_at
+                FROM messages
+                WHERE conv_id = $1
+                ORDER BY created_at ASC
+                """,
+                conv_id
+            )
+
+            messages = []
+            for row in rows:
+                citations = []
+                meta = row.get("metadata")
+                if isinstance(meta, str):
+                    import json as _json
+                    meta = _json.loads(meta)
+                if isinstance(meta, dict):
+                    # extract citations if stored in metadata
+                    raw_cites = meta.get("citations")
+                    if isinstance(raw_cites, list):
+                        citations = raw_cites
+
+                messages.append({
+                    "id": str(row["msg_id"]),
+                    "conversation_id": str(row["conv_id"]),
+                    "role": row["role"],
+                    "content": row["content"],
+                    "citations": citations,
+                    "created_at": row["created_at"],
+                })
+
+            logger.debug(f"Retrieved {len(messages)} messages for conv_id={conv_id}")
+            return messages
+        except Exception as e:
+            logger.error(f"Failed to get messages: conv_id={conv_id}, error={e}")
+            raise DatabaseException(f"Failed to get messages: {e}")
+
+    async def save_feedback(
+        self, message_id: str, is_positive: bool, reason: str = "", user_id: str = ""
+    ):
+        """Save user feedback to MySQL query_logs.
+
+        Uses the ``feedback`` TINYINT column: 1 = up / -1 = down.
+        ``question`` is populated as a summary string (NOT NULL constraint).
+        ``user_id`` is cast to int (MySQL BIGINT column).
+        """
+        try:
+            feedback_val = 1 if is_positive else -1
+            user_id_int = int(user_id) if user_id else 0
+            question_summary = f"Feedback for msg {message_id}"
+            if reason:
+                question_summary += f": {reason}"
+
+            await mysql.execute(
+                """
+                INSERT INTO query_logs (user_id, question, feedback)
+                VALUES (%s, %s, %s)
+                """,
+                user_id_int, question_summary, feedback_val,
+            )
+            logger.info(
+                f"Feedback saved: msg_id={message_id}, positive={is_positive}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save feedback: msg_id={message_id}, error={e}")
+            raise DatabaseException(f"Failed to save feedback: {e}")
+
+    async def _log_query(
+        self,
+        user_id: str,
+        question: str,
+        intent_type: str = "",
+        chunk_ids: Optional[List[str]] = None,
+        latency_ms: int = 0,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+    ):
+        """Write a query-log row to MySQL after every query.
+
+        Columns filled: user_id, question, rewritten_query (intent hint),
+        retrieved_chunk_ids, top_k, latency_ms, prompt_tokens, completion_tokens.
+        """
+        try:
+            user_id_int = int(user_id) if user_id else 0
+            rewritten = f"[intent={intent_type}]" if intent_type else None
+            chunk_ids_json = json.dumps(chunk_ids) if chunk_ids else None
+            top_k = len(chunk_ids) if chunk_ids else None
+
+            await mysql.execute(
+                """
+                INSERT INTO query_logs
+                  (user_id, question, rewritten_query, retrieved_chunk_ids,
+                   top_k, latency_ms, prompt_tokens, completion_tokens)
+                VALUES
+                  (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                user_id_int,
+                question,
+                rewritten,
+                chunk_ids_json,
+                top_k,
+                latency_ms,
+                prompt_tokens,
+                completion_tokens,
+            )
+            logger.debug(
+                f"Query log written: user_id={user_id_int}, latency={latency_ms}ms, "
+                f"chunks={top_k}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write query_log (non-fatal): {e}")
 
     async def delete_conversation(self, conv_id: str):
         try:

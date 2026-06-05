@@ -1,7 +1,8 @@
 import axios from 'axios';
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || 'http://localhost:8000',
+  // Dev: Vite proxy forwards /api → localhost:8008; Prod: set VITE_API_BASE
+  baseURL: import.meta.env.VITE_API_BASE || '',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
@@ -121,11 +122,12 @@ export const chatAPI = {
     api.get('/api/chat/conversations'),
   
   // Get conversation messages
-  getMessages: (conversationId: number) => 
+  getMessages: (conversationId: string) => 
     api.get(`/api/chat/conversations/${conversationId}/messages`),
   
   // SSE chat query (returns EventSource URL)
-  getQuerySSEUrl: (conversationId: number, question: string, scopeType: string = 'all', scopeIds?: number[]) => {
+  // EventSource 不支持自定义 Header，因此通过 query 参数传递 JWT token
+  getQuerySSEUrl: (conversationId: string, question: string, scopeType: string = 'all', scopeIds?: number[]) => {
     const params = new URLSearchParams();
     params.append('conversation_id', conversationId.toString());
     params.append('question', question);
@@ -133,11 +135,15 @@ export const chatAPI = {
     if (scopeIds) {
       params.append('scope_ids', scopeIds.join(','));
     }
+    const token = localStorage.getItem('token');
+    if (token) {
+      params.append('token', token);
+    }
     return `${api.defaults.baseURL}/api/chat/query?${params.toString()}`;
   },
   
   // Send feedback
-  sendFeedback: (messageId: number, isPositive: boolean, reason?: string) => 
+  sendFeedback: (messageId: string, isPositive: boolean, reason?: string) => 
     api.post('/api/chat/feedback', { message_id: messageId, is_positive: isPositive, reason }),
 };
 
@@ -162,6 +168,10 @@ export const observabilityAPI = {
 
 // ==================== Settings APIs ====================
 export const settingsAPI = {
+  // Get saved settings
+  getSettings: () =>
+    api.get('/api/settings'),
+
   // Save global settings
   saveSettings: (config: Record<string, any>) => 
     api.post('/api/settings', config),

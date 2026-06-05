@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import asyncio
 import json
 from app.schemas.advanced import ReviewGenerateRequest, CitationGraphResponse, CitationNode, CitationEdge
+from common.auth.deps import get_current_user_sse
 
 router = APIRouter(tags=["advanced"])
 
@@ -20,6 +21,7 @@ async def generate_review(
     topic: str,
     scope_type: str = "all",
     scope_ids: Optional[str] = None,
+    current: Dict[str, Any] = Depends(get_current_user_sse),
 ):
     # SSE 经 GET 暴露(EventSource 仅支持 GET)，参数走 query string。
     # Streaming Response Generator for SSE review generation

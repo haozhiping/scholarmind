@@ -1,13 +1,18 @@
+import hashlib
 import json
 import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
+from redis import Redis
+from rq import Queue
 
 from app.schemas.papers import (
     FolderCreate, FolderResponse, PaperDetailResponse, PaperResponse, PaperUploadResponse,
 )
 from common.auth.deps import get_current_user
+from common.clients.minio import upload_bytes
+from common.config import settings
 from common.db.mysql_client import mysql
 from common.exceptions import NotFoundException
 
@@ -45,7 +50,7 @@ def _paper_row_to_response(row: Dict[str, Any]) -> PaperDetailResponse:
         folder_id=row.get("folder_id"),
         status=_STATUS_DISPLAY.get(db_status, db_status),
         file_key=row.get("pdf_key") or "",
-        file_size=0,
+        file_size=int(row.get("file_size") or 0),
         pages=row.get("num_pages") or 0,
         created_at=row["created_at"],
         batch_id=None,
@@ -63,11 +68,54 @@ async def upload_papers(
     folder_id: Optional[int] = Form(None),
     current=Depends(get_current_user),
 ):
-    # NOTE: 落 MinIO + 计算 file_hash + 写 papers/ingest_tasks + enqueue RQ
-    # 属于「上传→解析→入库」链路，将在下一轮实现。此处仅返回批次/任务标识，
-    # 保证前端上传交互不报错。
     batch_id = f"batch-{uuid.uuid4().hex[:8]}"
-    task_ids = [f"task-{uuid.uuid4().hex[:12]}" for _ in files]
+    task_ids: List[str] = []
+    # Initialize RQ queue connection (shared for all files in this batch)
+    redis_conn = Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_DB)
+    rq_queue = Queue("ingest", connection=redis_conn)
+
+    for file in files:
+        # Derive a paper title from the uploaded filename
+        filename = file.filename or "untitled.pdf"
+        title = filename.rsplit(".pdf", 1)[0].strip() or filename
+        # Calculate filesize and hash
+        content = await file.read()
+        file_size = len(content)
+        file_hash_str = hashlib.md5(content).hexdigest()[:16]
+        file_key = f"papers/{current['id']}/{uuid.uuid4().hex[:12]}/{filename}"
+
+        # 1) Store PDF in MinIO (async via thread)
+        import asyncio
+        await asyncio.to_thread(
+            upload_bytes, content, settings.MINIO_BUCKET_PDF, file_key,
+            "application/pdf",
+        )
+
+        # 2) Insert paper record into DB
+        paper_id = await mysql.execute(
+            "INSERT INTO papers (user_id, title, pdf_key, folder_id, file_hash, file_size, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'pending')",
+            current["id"], title, file_key, folder_id, file_hash_str, file_size,
+        )
+        task_uuid = f"task-{uuid.uuid4().hex[:12]}"
+        task_ids.append(task_uuid)
+
+        # 3) Insert ingest task record
+        await mysql.execute(
+            "INSERT INTO ingest_tasks (task_id, paper_id, user_id, status, stage, progress, batch_id) "
+            "VALUES (%s, %s, %s, 'pending', 'parsing', 0, %s)",
+            task_uuid, paper_id, current["id"], batch_id,
+        )
+
+        # 4) Enqueue RQ job to kick off parsing → indexing pipeline
+        rq_queue.enqueue(
+            "app.worker.main.handle_ingest_job",
+            user_id=current["id"],
+            paper_id=paper_id,
+            pdf_key=file_key,
+            task_id=task_uuid,
+        )
+
     return PaperUploadResponse(batch_id=batch_id, tasks=task_ids)
 
 
@@ -85,8 +133,10 @@ async def list_papers(
         sql += " AND folder_id=%s"
         args.append(folder_id)
     if status is not None:
+        # Frontend sends "completed", DB stores "done"
+        db_status = "done" if status == "completed" else status
         sql += " AND status=%s"
-        args.append(status)
+        args.append(db_status)
     sql += " ORDER BY created_at DESC"
     rows = await mysql.fetchall(sql, *args)
     return [_paper_row_to_response(r) for r in rows]

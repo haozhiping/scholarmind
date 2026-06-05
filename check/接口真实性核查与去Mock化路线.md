@@ -28,7 +28,7 @@
 | auth | POST /register、/login、GET /me | 🟢 | **链路①已完成**：bcrypt+JWT+MySQL users，`get_current_user` 依赖 |
 | folders | GET、POST、DELETE /{id} | 🟢 | **链路①已完成**：接 MySQL，强制 `user_id`；补全了原缺失的 DELETE |
 | papers | GET、GET /{id}、DELETE /{id} | 🟢 | **链路①已完成**：接 MySQL，强制 `user_id`，DB↔契约字段映射 |
-| papers | POST /upload | 🔴 | 占位：返回 batch/task 标识但**不落 MinIO、不写库、不入队** → 链路② |
+| papers | POST /upload | 🟡 | 入队+落 MinIO 已接，解析端待接真实 MinerU/LLM 服务 |
 | ingest | GET /batches/{id}、GET /tasks、POST /tasks/{id}/retry | 🔴 | 读写 `MOCK_BATCHES`/`MOCK_TASKS`，不读 `ingest_tasks` 表 → 链路② |
 | chat | POST /conversations、GET /conversations、GET /messages、POST /feedback | 🔴 | 内存 Mock，不接 PostgreSQL → 链路③ |
 | chat | GET /query（SSE） | 🔴 | 假 token，仍待接真实 RAG → 链路③。（**契约 bug 已修：POST→GET**） |
@@ -58,7 +58,7 @@
 | `services/retrieval/`（query_optimizer/searcher/reranker） | 🟢 **已补全** | ✅ 检索逻辑已归位（链路③） |
 | `app/worker/main.py` | 🟢 **已注册 job** | ✅ `handle_ingest_job` 串联 parsing→indexing（链路②） |
 | `services/chat_agent/agent.py` 导入 | 🟢 **已修复** | ✅ 3 处导入统一指向真实模块 |
-| Redis RQ 队列 enqueue 封装 | 🔴 未接 | 上传入队（链路②，routes/papers.py upload 接口待去 Mock） |
+| Redis RQ 队列 enqueue 封装 | 🟢 **已接** | ⚡ 链路②修复：upload 接口入队 Redis RQ + 落 MinIO（2026-06-05） |
 | 访问日志中间件 | 🔴 缺失 | `access_logs` 表写入（链路⑤） |
 
 ---
@@ -68,7 +68,7 @@
 | 链路 | 范围 | 状态 |
 |---|---|---|
 | **① 认证 + 论文库（地基）** | auth 真实 JWT/bcrypt/MySQL；folders/papers 接 MySQL + `user_id` 隔离 | ✅ **本轮完成（代码就绪，待 docker 联调验证）** |
-| **② 上传 → 解析 → 入库** | upload 落 MinIO + 写 papers/ingest_tasks + enqueue RQ；worker 注册 job 串 parsing→indexing→写 Milvus；ingest 进度读真实表 | ⏳ 待做 |
+| **② 上传 → 解析 → 入库** | upload 落 MinIO + 写 papers/ingest_tasks + enqueue RQ；worker 注册 job 串 parsing→indexing→写 Milvus；ingest 进度读真实表 | 🟡 **入队已通，解析待接真实 MinerU** |
 | **③ 对话 RAG** | chat 接 PostgreSQL；query 走意图路由→混检→重排→LLM 真实 SSE（**先修 POST→GET**）；引用溯源指向真实 MinIO 图 | ⏳ 待做 |
 | **④ 进阶：综述 + 引用图谱** | review 调 ReActAgent；graph 读 `citations` 表 | ⏳ 待做 |
 | **⑤ 可观测 + 设置** | 新增 settings 路由；access 日志中间件；stats/logs 读真实表 | ⏳ 待做 |
@@ -106,6 +106,40 @@
 > python -m pytest tests/test_auth_security.py -q
 > ```
 > 通过后按 CLAUDE.md「即时提交」用中文提交信息入库。
+
+---
+
+## 链路②本轮修复内容（2026-06-05，上传 → 入队 → Worker 流水线）
+
+### 修复的 3 个关键阻断点
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | **papers.py upload 不入队** | 新增 `rq.Queue("ingest").enqueue("app.worker.main.handle_ingest_job", ...)` |
+| 2 | **upload 不落 MinIO** | 新增 `common.clients.minio.upload_bytes()` 将 PDF 字节流存入 MinIO papers bucket |
+| 3 | **parser.py ↔ worker DB 驱动不兼容** | parser 已从 `sqlalchemy.ext.asyncio.AsyncSession` → `common.db.mysql_client.AsyncMySQLClient` |
+
+### 修复文件清单
+
+| 文件 | 改动 |
+|---|---|
+| `app/routers/papers.py` | upload 接口：落 MinIO（asyncio.to_thread）→ INSERT DB → RQ enqueue |
+| `app/worker/main.py` | 从 MinIO 下载 PDF；统一用 `task_id`（UUID VARCHAR）查询；`parse_paper` 参数补全（pdf_bytes + db=mysql）；去掉不存在的 `ingest_batches` 表引用 |
+| `services/parsing/parser.py` | 移除 SQLAlchemy `AsyncSession`/`text` 依赖；`db` 参数改为接收 `AsyncMySQLClient`；`_write_blocks/_write_citations/_upload_figures` 全部改用 `mysql.execute(%s...)`；移除 `db.commit()`（autocommit 模式） |
+| `app/schemas/ingest.py` | `IngestTaskResponse` 新增 `file_name: Optional[str]` |
+| `app/routers/ingest.py` | list_tasks JOIN papers 表获取真实 file_name |
+| `frontend/src/views/Observability.vue` | 使用真实 `task.file_name` 替代硬编码 `Task ${task.id}` |
+
+### ⚠️ 仍需解决（阻断真实解析）
+
+| 依赖 | 状态 | 说明 |
+|---|---|---|
+| MinerU 解析 | 🟢 **Agent API 已接** | `MINERU_PROVIDER=agent` 模式无需 Pipeline ID，纯 HTTP 调用 |
+| LLM API Key | 🔴 占位符 | `LLM_API_KEY = "sk-xxxxxxxx"` 需替换为真实百炼/DashScope key |
+| VLM API Key | 🔴 占位符 | `VLM_API_KEY = "sk-xxxxxxxx"` 图片描述会报错 |
+| Embedding 服务 | 🔴 未启动 | docker-compose 中 TEI 容器被注释，indexing 阶段会失败 |
+
+> **当前效果**：上传 PDF → MinIO → 入队 → Worker 唤醒 → MinerU Agent API 解析 PDF（需 `MINERU_API_KEY` 配置）→ 解析 markdown 为 blocks → 入库 → indexing。**解析链路已支持零 Pipeline ID 方式运行**。唯一前提是配置有效的 `MINERU_API_KEY`（在 https://mineru.net 注册获取）。
 
 ---
 

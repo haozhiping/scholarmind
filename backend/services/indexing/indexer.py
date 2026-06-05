@@ -5,9 +5,6 @@ from typing import List, Dict, Any, Optional
 import re
 import xxhash
 from pathlib import Path
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
-
 from common.clients.llm import embed_texts, chat_complete_json
 from common.config import settings
 from common.logging import logger
@@ -74,22 +71,23 @@ class Chunker:
 
         return chunks
 
-    async def chunk_paper(self, db: AsyncSession, paper_id: int, user_id: int) -> List[Chunk]:
+    async def chunk_paper(self, db, paper_id: int, user_id: int) -> List[Chunk]:
         """Chunk all doc_blocks for a paper."""
-        result = await db.execute(
-            text("""
-                SELECT id, block_type, content, page_num, bbox, image_key
-                FROM doc_blocks
-                WHERE paper_id = :paper_id AND user_id = :user_id
-                ORDER BY page_num, id
-            """),
-            {"paper_id": paper_id, "user_id": user_id}
+        blocks = await db.fetchall(
+            "SELECT id, block_type, content, page_num, bbox, image_key "
+            "FROM doc_blocks WHERE paper_id=%s AND user_id=%s "
+            "ORDER BY page_num, id",
+            paper_id, user_id,
         )
-        blocks = await result.fetchall()
 
         chunks = []
         for block in blocks:
-            block_id, block_type, content, page_num, bbox, image_key = block
+            block_id = block["id"]
+            block_type = block["block_type"]
+            content = block["content"]
+            page_num = block["page_num"]
+            bbox = block["bbox"]
+            image_key = block["image_key"]
 
             if block_type in ("table", "figure", "formula"):
                 chunk = Chunk(
@@ -176,9 +174,13 @@ async def vectorize_chunks(chunks: List[Chunk]) -> None:
 async def index_paper(
     user_id: int,
     paper_id: int,
-    db: AsyncSession,
+    db=None,
 ) -> int:
     """Complete indexing pipeline: chunk → enrich → vectorize → write to Milvus."""
+    if db is None:
+        from common.db.mysql_client import mysql as _db
+        db = _db
+
     logger.info(f"[index] Starting indexing for paper_id={paper_id} user_id={user_id}")
 
     chunker = Chunker(chunk_size=512, overlap_ratio=0.15)
@@ -220,9 +222,8 @@ async def index_paper(
     logger.info(f"[index] Written {len(chunks)} chunks to Milvus")
 
     await db.execute(
-        text("UPDATE papers SET chunk_count = :cnt WHERE id = :pid AND user_id = :uid"),
-        {"cnt": len(chunks), "pid": paper_id, "uid": user_id}
+        "UPDATE papers SET chunk_count=%s WHERE id=%s AND user_id=%s",
+        len(chunks), paper_id, user_id,
     )
-    await db.commit()
 
     return len(chunks)

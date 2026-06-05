@@ -1,0 +1,9 @@
+-- Seed default admin user for ScholarMind
+-- Default credentials: admin / admin123
+--
+-- ⚠️ 请勿直接执行此 SQL（bcrypt 含 $ 符号会被 Shell 截断）
+-- 正确做法：在 backend 容器内执行 Python 种子脚本：
+--   docker compose exec backend python -m common.db.seed
+--   或重置密码:     docker compose exec backend python -m common.db.seed --reset
+--
+-- 如果你确实要用纯 SQL：确保复制完整 hash 不要丢失 $ 前缀部分

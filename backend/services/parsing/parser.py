@@ -17,11 +17,9 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
 
 from common.clients.llm import chat_complete_json, vlm_describe_image
 from common.config import settings
@@ -134,11 +132,98 @@ def _find_block_list(obj: Any) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: MinerU parsing
+# Step 1: MinerU parsing — unified entry (dispatches by MINERU_PROVIDER)
 # ---------------------------------------------------------------------------
 
-def _sync_mineru_call(pdf_bytes: bytes) -> dict:
-    """Blocking MinerU KIE call. Wrapped by _call_mineru via asyncio.to_thread."""
+async def _call_mineru(pdf_bytes: bytes) -> dict:
+    """Dispatch to the configured MinerU provider."""
+    provider = settings.MINERU_PROVIDER
+    if provider == "agent":
+        return await _call_mineru_agent(pdf_bytes)
+    if provider == "kie":
+        return await _call_mineru_kie(pdf_bytes)
+    raise ValueError(f"unsupported MINERU_PROVIDER: {provider}")
+
+
+# -- Agent API (lightweight, signature upload + poll) --
+
+async def _call_mineru_agent(pdf_bytes: bytes) -> dict:
+    """Submit PDF to MinerU Agent Parse API (file mode), poll, return parsed markdown.
+
+    Flow:
+      1. POST /api/v1/agent/parse/file      → get task_id + signed file_url
+      2. PUT  pdf_bytes → file_url           (direct OSS upload)
+      3. Poll GET /api/v1/agent/parse/{task_id} → download markdown on done
+    """
+    import time
+
+    headers = {"Content-Type": "application/json"}
+    if settings.MINERU_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.MINERU_API_KEY}"
+
+    body = {
+        "file_name": "paper.pdf",
+        "language": settings.MINERU_LANGUAGE,
+        "enable_table": settings.MINERU_ENABLE_TABLE,
+        "enable_formula": settings.MINERU_ENABLE_FORMULA,
+        "is_ocr": settings.MINERU_IS_OCR,
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30)) as client:
+        # 1) Acquire signed upload URL
+        logger.info("[parse-agent] requesting signed upload URL")
+        resp = await client.post(
+            f"{settings.MINERU_AGENT_BASE_URL}/parse/file",
+            json=body, headers=headers,
+        )
+        result = resp.json()
+        if result.get("code") != 0:
+            raise RuntimeError(f"MinerU Agent submit failed: code={result.get('code')} msg={result.get('msg')}")
+
+        task_id = result["data"]["task_id"]
+        file_url = result["data"]["file_url"]
+        logger.info(f"[parse-agent] task_id={task_id}, uploading file...")
+
+        # 2) PUT file directly to the signed OSS URL (no extra auth header needed)
+        put_resp = await client.put(file_url, content=pdf_bytes)
+        if put_resp.status_code not in (200, 201, 204):
+            raise RuntimeError(f"MinerU Agent file upload failed: HTTP {put_resp.status_code}")
+        logger.info("[parse-agent] file uploaded, waiting for parse...")
+
+        # 3) Poll until done or timeout
+        poll_url = f"{settings.MINERU_AGENT_BASE_URL}/parse/{task_id}"
+        start = time.time()
+        while time.time() - start < settings.MINERU_TIMEOUT:
+            await asyncio.sleep(settings.MINERU_POLL_INTERVAL)
+
+            resp = await client.get(poll_url, headers=headers)
+            result = resp.json()
+            state = result.get("data", {}).get("state", "")
+
+            if state == "done":
+                markdown_url = result["data"]["markdown_url"]
+                logger.info(f"[parse-agent] parse done, downloading markdown from {markdown_url}")
+                md_resp = await client.get(markdown_url)
+                return {"markdown": md_resp.text, "task_id": task_id}
+
+            if state == "failed":
+                err = result.get("data", {}).get("err_msg", "unknown")
+                raise RuntimeError(f"MinerU Agent parse failed: {err}")
+
+            logger.debug(f"[parse-agent] state={state}, elapsed={int(time.time() - start)}s")
+
+        raise RuntimeError(f"MinerU Agent poll timeout after {settings.MINERU_TIMEOUT}s (task_id={task_id})")
+
+
+# -- KIE SDK (legacy, needs Pipeline ID + mineru-kie-sdk package) --
+
+async def _call_mineru_kie(pdf_bytes: bytes) -> dict:
+    """Async wrapper: run the blocking KIE SDK in a thread."""
+    return await asyncio.to_thread(_sync_mineru_kie_call, pdf_bytes)
+
+
+def _sync_mineru_kie_call(pdf_bytes: bytes) -> dict:
+    """Blocking MinerU KIE call."""
     import os
     import tempfile
     from mineru_kie_sdk import MineruKIEClient
@@ -167,13 +252,21 @@ def _sync_mineru_call(pdf_bytes: bytes) -> dict:
             os.remove(tmp_path)
 
 
-async def _call_mineru(pdf_bytes: bytes) -> dict:
-    """Async wrapper: run the blocking SDK in a thread to keep the loop free."""
-    return await asyncio.to_thread(_sync_mineru_call, pdf_bytes)
-
+# -- Block normalization (shared) --
 
 def _mineru_to_blocks(parse_result: dict) -> list[Block]:
-    """Normalize MinerU parse result into Block list. Tolerant of unknown shapes."""
+    """Normalize MinerU parse result into Block list.
+
+    Supports two formats:
+      - KIE JSON: structured blocks with type/content/bbox/page_num
+      - Agent markdown: raw markdown string under "markdown" key
+    """
+    # Agent API → markdown string
+    md = parse_result.get("markdown")
+    if isinstance(md, str) and len(md) > 50:
+        return _markdown_to_blocks(md)
+
+    # KIE JSON → structured dict
     raw_blocks = _find_block_list(parse_result)
     if not raw_blocks:
         logger.warning("[parse] no block list found in MinerU parse result")
@@ -199,6 +292,77 @@ def _mineru_to_blocks(parse_result: dict) -> list[Block]:
             raw_image=rb.get("image") or rb.get("image_base64"),
         ))
     return blocks
+
+
+# -- Markdown → Blocks (Agent API output) --
+
+_MATH_BLOCK_RE = re.compile(r"^\${2,}(.*?)\${2,}$", re.DOTALL)
+_IMAGE_RE = re.compile(r"!\[(.*?)\]\((.*?)\)")
+_TABLE_ROW_RE = re.compile(r"^\|.+\|$")
+
+
+def _markdown_to_blocks(md: str) -> list[Block]:
+    """Parse MinerU Agent API markdown output into Block list.
+
+    Heuristic parser — splits by blank lines, then classifies each chunk.
+    """
+    chunks = _split_markdown_chunks(md)
+    blocks: list[Block] = []
+    for chunk in chunks:
+        blocks.append(_classify_chunk(chunk))
+    logger.info(f"[parse-agent] markdown → {len(blocks)} blocks")
+    return blocks
+
+
+def _split_markdown_chunks(md: str) -> list[str]:
+    """Split markdown into logical chunks separated by blank lines."""
+    lines = md.split("\n")
+    chunks: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        nonlocal buf
+        text = "\n".join(buf).strip()
+        if text:
+            chunks.append(text)
+        buf = []
+
+    for line in lines:
+        stripped = line.strip()
+        # Blank line → flush current chunk
+        if not stripped:
+            flush()
+            continue
+        buf.append(line)
+
+    flush()
+    return chunks
+
+
+def _classify_chunk(text: str) -> Block:
+    """Classify a single markdown chunk as text / table / formula / figure."""
+    # Formula: $$...$$ or $...$
+    if _MATH_BLOCK_RE.search(text):
+        return Block(block_type="formula", content=text)
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    # Table: at least 2 rows starting/filled with |
+    table_rows = [l for l in lines if _TABLE_ROW_RE.match(l)]
+    if len(table_rows) >= 2:
+        return Block(block_type="table", content=text)
+
+    # Image: ![...](...)
+    img_match = _IMAGE_RE.search(text)
+    if img_match and len(lines) <= 2:
+        return Block(
+            block_type="figure",
+            content=img_match.group(1) or "",
+            image_key=img_match.group(2),   # CDN URL for later download
+        )
+
+    # Everything else is text
+    return Block(block_type="text", content=text)
 
 
 # ---------------------------------------------------------------------------
@@ -326,22 +490,22 @@ async def parse_paper(
     user_id: int,
     paper_id: int,
     pdf_key: str,
-    db: AsyncSession,
     *,
-    pdf_bytes: bytes | None = None,  # required for MinerU KIE SDK
+    pdf_bytes: bytes,
+    db: Any = None,  # AsyncMySQLClient from common.db.mysql_client
 ) -> ParseResult:
     """
     Full parse pipeline for one paper. Called from RQ worker (not request thread).
     Writes doc_blocks/citations, uploads figures, updates papers.status, returns ParseResult.
     """
+    if db is None:
+        from common.db.mysql_client import mysql as _db
+        db = _db
+
     logger.info(
         f"[parse] paper_id={paper_id} user_id={user_id} "
         f"provider={settings.REFERENCE_PARSER_PROVIDER}"
     )
-
-    if pdf_bytes is None:
-        logger.warning("[parse] MinerU KIE SDK requires pdf_bytes; none provided")
-        raise ValueError("pdf_bytes is required for MinerU KIE parsing")
 
     # --- Step 1: MinerU (blocking SDK wrapped in a thread) ---
     parse_result = await _call_mineru(pdf_bytes)
@@ -358,7 +522,7 @@ async def parse_paper(
     await _describe_figures(blocks)
 
     # --- Step 5: reference extraction ---
-    if settings.REFERENCE_PARSER_PROVIDER == "grobid" and pdf_bytes is not None:
+    if settings.REFERENCE_PARSER_PROVIDER == "grobid":
         references = await _extract_refs_grobid(pdf_bytes)
     else:
         references = await _extract_refs_llm(blocks)
@@ -367,10 +531,9 @@ async def parse_paper(
 
     # --- Step 6: mark paper done ---
     await db.execute(
-        text("UPDATE papers SET status='done' WHERE id=:pid AND user_id=:uid"),
-        {"pid": paper_id, "uid": user_id},
+        "UPDATE papers SET status='done' WHERE id=%s AND user_id=%s",
+        paper_id, user_id,
     )
-    await db.commit()
 
     return ParseResult(
         paper_id=paper_id,
@@ -416,7 +579,7 @@ def _sync_presigned(client, bucket: str, key: str) -> str:
     return client.presigned_get_object(bucket, key)
 
 
-async def _upload_figures(user_id: int, paper_id: int, blocks: list[Block], db: AsyncSession) -> None:
+async def _upload_figures(user_id: int, paper_id: int, blocks: list[Block], db) -> None:
     """Upload figure images to MinIO and backfill image_key. Needs block_id set first."""
     targets = [b for b in blocks if b.block_type == "figure" and b.raw_image and b.block_id]
     if not targets:
@@ -430,8 +593,8 @@ async def _upload_figures(user_id: int, paper_id: int, blocks: list[Block], db: 
             await asyncio.to_thread(_sync_put_object, client, bucket, key, data)
             b.image_key = key
             await db.execute(
-                text("UPDATE doc_blocks SET image_key=:k WHERE id=:id AND user_id=:uid"),
-                {"k": key, "id": b.block_id, "uid": user_id},
+                "UPDATE doc_blocks SET image_key=%s WHERE id=%s AND user_id=%s",
+                key, b.block_id, user_id,
             )
         except Exception as e:
             logger.warning(f"[parse] figure upload failed block_id={b.block_id}: {e}")
@@ -441,37 +604,20 @@ async def _upload_figures(user_id: int, paper_id: int, blocks: list[Block], db: 
 # DB writes
 # ---------------------------------------------------------------------------
 
-async def _write_blocks(user_id: int, paper_id: int, blocks: list[Block], db: AsyncSession) -> None:
+async def _write_blocks(user_id: int, paper_id: int, blocks: list[Block], db) -> None:
     for b in blocks:
-        result = await db.execute(
-            text("""
-                INSERT INTO doc_blocks (paper_id, user_id, block_type, content, page_num, bbox, image_key)
-                VALUES (:paper_id, :user_id, :block_type, :content, :page_num, :bbox, :image_key)
-            """),
-            {
-                "paper_id": paper_id,
-                "user_id": user_id,
-                "block_type": b.block_type,
-                "content": b.content,
-                "page_num": b.page_num,
-                "bbox": json.dumps(b.bbox) if b.bbox else None,
-                "image_key": b.image_key,
-            },
+        bbox_json = json.dumps(b.bbox) if b.bbox else None
+        block_id = await db.execute(
+            "INSERT INTO doc_blocks (paper_id, user_id, block_type, content, page_num, bbox, image_key) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            paper_id, user_id, b.block_type, b.content, b.page_num, bbox_json, b.image_key,
         )
-        b.block_id = result.lastrowid
+        b.block_id = block_id
 
 
-async def _write_citations(paper_id: int, references: list[dict], db: AsyncSession) -> None:
-    from sqlalchemy import text
+async def _write_citations(paper_id: int, references: list[dict], db) -> None:
     for ref in references:
         await db.execute(
-            text("""
-                INSERT INTO citations (src_paper_id, dst_title, raw_ref)
-                VALUES (:src_paper_id, :dst_title, :raw_ref)
-            """),
-            {
-                "src_paper_id": paper_id,
-                "dst_title": ref.get("title", ""),
-                "raw_ref": ref.get("raw_ref", ""),
-            },
+            "INSERT INTO citations (src_paper_id, dst_title, raw_ref) VALUES (%s, %s, %s)",
+            paper_id, ref.get("title", ""), ref.get("raw_ref", ""),
         )

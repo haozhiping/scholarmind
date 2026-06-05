@@ -4,7 +4,7 @@ current user as a dict. Every business router depends on this so that
 """
 from typing import Any, Dict, Optional
 
-from fastapi import Depends
+from fastapi import Depends, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 
@@ -16,6 +16,21 @@ from .security import decode_token
 _bearer = HTTPBearer(auto_error=False)
 
 
+def _payload_to_user(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sub = payload.get("sub")
+    if sub is None:
+        raise AuthException("令牌缺少用户标识")
+    try:
+        user_id = int(sub)
+    except (TypeError, ValueError):
+        raise AuthException("令牌用户标识非法")
+    return {
+        "id": user_id,
+        "username": payload.get("username"),
+        "role": payload.get("role", "user"),
+    }
+
+
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> Dict[str, Any]:
@@ -25,17 +40,26 @@ async def get_current_user(
         payload = decode_token(credentials.credentials)
     except JWTError:
         raise AuthException("令牌无效或已过期")
+    return _payload_to_user(payload)
 
-    sub = payload.get("sub")
-    if sub is None:
-        raise AuthException("令牌缺少用户标识")
+
+async def get_current_user_sse(
+    token: Optional[str] = Query(None, description="JWT token for SSE (EventSource 不支持自定义 Header)"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> Dict[str, Any]:
+    """SSE 兼容的认证依赖：优先从 query param `token` 读取 JWT，
+    回退到标准 Bearer Header。因为浏览器 EventSource API 不支持自定义请求头。"""
+    raw = None
+    if token:
+        raw = token
+    elif credentials is not None and credentials.credentials:
+        raw = credentials.credentials
+
+    if not raw:
+        raise AuthException("缺少认证令牌")
+
     try:
-        user_id = int(sub)
-    except (TypeError, ValueError):
-        raise AuthException("令牌用户标识非法")
-
-    return {
-        "id": user_id,
-        "username": payload.get("username"),
-        "role": payload.get("role", "user"),
-    }
+        payload = decode_token(raw)
+    except JWTError:
+        raise AuthException("令牌无效或已过期")
+    return _payload_to_user(payload)

@@ -91,6 +91,13 @@ async function handleSubmit() {
       // Login API call
       const res = await authAPI.login(form.username, form.password);
       authStore.setToken(res.data.access_token);
+      // Fetch user info after login
+      try {
+        const userRes = await authAPI.getMe();
+        authStore.setUser(userRes.data);
+      } catch (_) {
+        // Non-critical: user info fetch failed
+      }
       router.push('/library');
     } else {
       // Register API call
@@ -99,7 +106,7 @@ async function handleSubmit() {
       errorMsg.value = '注册成功，请使用新账号登录！';
     }
   } catch (error: any) {
-    errorMsg.value = error.response?.data?.detail || error.message || '操作失败，请稍后重试';
+    errorMsg.value = error.response?.data?.error || error.response?.data?.detail || error.message || '操作失败，请稍后重试';
   } finally {
     loading.value = false;
   }

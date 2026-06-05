@@ -1,103 +1,159 @@
-from fastapi import APIRouter, HTTPException, status
-from fastapi.responses import StreamingResponse
-from typing import List, Optional
-from datetime import datetime
-import asyncio
 import json
+import time
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
+
 from app.schemas.chat import (
-    ConversationResponse, ConversationCreate, MessageResponse, 
-    ChatQueryRequest, FeedbackRequest, FeedbackResponse, CitationResponse
+    ConversationResponse,
+    ConversationCreate,
+    MessageResponse,
+    FeedbackRequest,
+    FeedbackResponse,
+    CitationResponse,
 )
+from common.auth.deps import get_current_user, get_current_user_sse
+from common.exceptions import NotFoundException, DatabaseException
+from common.logging import logger
+
+# ChatService — lazy singleton, initialised on first request.
+from services.chat_agent.chat_service import ChatService
+from services.chat_agent.schemas import ChatRequest as AgentChatRequest
+
+_chat_service: Optional[ChatService] = None
+
+
+def get_chat_service() -> ChatService:
+    global _chat_service
+    if _chat_service is None:
+        _chat_service = ChatService()
+    return _chat_service
+
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
-# Mock In-Memory Database
-MOCK_CONVERSATIONS = [
-    ConversationResponse(
-        id=101,
-        title="Attention 与 Transformer 结构探讨",
-        folder_id=1,
-        paper_ids=[1],
-        created_at=datetime.now(),
-        updated_at=datetime.now()
-    ),
-    ConversationResponse(
-        id=102,
-        title="RAG 混合检索及优化路线",
-        folder_id=3,
-        paper_ids=[2],
-        created_at=datetime.now(),
-        updated_at=datetime.now()
+
+# ---------------------------------------------------------------------------
+# Helpers — schema ↔ service mapping
+# ---------------------------------------------------------------------------
+
+def _conv_to_response(conv) -> ConversationResponse:
+    """Convert ChatService Conversation → route ConversationResponse."""
+    return ConversationResponse(
+        id=str(conv.conv_id),
+        title=conv.title or "",
+        folder_id=getattr(conv, "folder_id", None),
+        paper_ids=getattr(conv, "paper_ids", None) or [],
+        created_at=conv.created_at,
+        updated_at=getattr(conv, "updated_at", conv.created_at),
     )
-]
 
-MOCK_MESSAGES = {
-    101: [
-        MessageResponse(
-            id=1001,
-            conversation_id=101,
-            role="user",
-            content="什么是 Transformer 架构的核心？",
-            citations=[],
-            created_at=datetime.now()
-        ),
-        MessageResponse(
-            id=1002,
-            conversation_id=101,
-            role="assistant",
-            content="Transformer 架构的核心是自注意力机制（Self-Attention），它允许模型在处理序列中的每个位置时，计算该位置与序列中所有其他位置的相关性，从而建立全局依赖关系。",
-            citations=[
-                CitationResponse(
-                    paper_id=1,
-                    paper_title="Attention Is All You Need",
-                    page_num=3,
-                    bbox="[3, 100, 150, 480, 280]",
-                    chunk_type="text",
-                    content="We propose the Transformer, a model architecture eschewing recurrence and instead relying entirely on an attention mechanism...",
-                    image_key=None
-                )
-            ],
-            created_at=datetime.now()
-        )
-    ],
-    102: []
-}
 
-@router.post("/conversations", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED,
-             summary="新建对话",
-             description="创建一个新的对话会话，可绑定文件夹或指定论文范围（`paper_ids`）。后续提问时带上 `conversation_id` 即可携带上下文记忆。")
-async def create_conversation(data: ConversationCreate):
-    new_id = len(MOCK_CONVERSATIONS) + 101
-    title = data.title or f"新会话 {new_id}"
-    new_conv = ConversationResponse(
-        id=new_id,
-        title=title,
-        folder_id=data.folder_id,
-        paper_ids=data.paper_ids or [],
-        created_at=datetime.now(),
-        updated_at=datetime.now()
+def _msg_to_response(msg: Dict[str, Any]) -> MessageResponse:
+    """Convert ChatService message dict → route MessageResponse."""
+    cites = []
+    for c in msg.get("citations") or []:
+        cites.append(CitationResponse(
+            paper_id=c.get("paper_id", 0),
+            paper_title=c.get("paper_title", ""),
+            page_num=c.get("page_num") or c.get("page", 0),
+            bbox=c.get("bbox", ""),
+            chunk_type=c.get("chunk_type", "text"),
+            content=c.get("content", ""),
+            image_key=c.get("image_key"),
+        ))
+    return MessageResponse(
+        id=msg["id"],
+        conversation_id=msg["conversation_id"],
+        role=msg["role"],
+        content=msg["content"],
+        citations=cites if cites else None,
+        created_at=msg["created_at"],
     )
-    MOCK_CONVERSATIONS.append(new_conv)
-    MOCK_MESSAGES[new_id] = []
-    return new_conv
 
-@router.get("/conversations", response_model=List[ConversationResponse],
-            summary="对话列表",
-            description="获取当前用户的所有对话会话，按更新时间倒序排列。")
-async def list_conversations():
-    return MOCK_CONVERSATIONS
 
-@router.get("/conversations/{id}/messages", response_model=List[MessageResponse],
-            summary="对话历史消息",
-            description="获取指定会话的完整消息历史，每条 assistant 消息包含引用溯源信息（`citations`：论文ID、页码、bbox 坐标、原文片段）。")
-async def list_messages(id: int):
-    if id in MOCK_MESSAGES:
-        return MOCK_MESSAGES[id]
-    return []
+def _user_id_from_auth(current: Dict[str, Any]) -> str:
+    """Extract user_id string from auth dict (id may be int or str)."""
+    return str(current.get("id", ""))
 
-@router.get("/query",
-            summary="论文问答（SSE 流式）",
-             description="""向已入库的论文提问，SSE 流式返回答案和引用。
+
+# ---------------------------------------------------------------------------
+# 1. POST /conversations — create
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/conversations",
+    response_model=ConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="新建对话",
+    description="创建一个新的对话会话。后续提问时带上 conversation_id 即可携带上下文记忆。",
+)
+async def create_conversation(
+    data: ConversationCreate,
+    current: Dict[str, Any] = Depends(get_current_user),
+):
+    svc = get_chat_service()
+    try:
+        conv = await svc.create_conversation(user_id=_user_id_from_auth(current))
+        return _conv_to_response(conv)
+    except DatabaseException as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# 2. GET /conversations — list
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/conversations",
+    response_model=List[ConversationResponse],
+    summary="对话列表",
+    description="获取当前用户的所有对话会话，按更新时间倒序排列。",
+)
+async def list_conversations(
+    current: Dict[str, Any] = Depends(get_current_user),
+):
+    svc = get_chat_service()
+    try:
+        convs = await svc.get_conversations(user_id=_user_id_from_auth(current))
+        return [_conv_to_response(c) for c in convs]
+    except DatabaseException as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# 3. GET /conversations/{id}/messages — message history
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/conversations/{id}/messages",
+    response_model=List[MessageResponse],
+    summary="对话历史消息",
+    description="获取指定会话的完整消息历史。",
+)
+async def list_messages(
+    id: str,
+    current: Dict[str, Any] = Depends(get_current_user),
+):
+    svc = get_chat_service()
+    try:
+        msgs = await svc.get_messages(conv_id=id)
+        return [_msg_to_response(m) for m in msgs]
+    except NotFoundException as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except DatabaseException as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# 4. GET /query — SSE streaming chat
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/query",
+    summary="论文问答（SSE 流式）",
+    description="""向已入库的论文提问，SSE 流式返回答案和引用。
 
 **流程**：意图路由 → 查询改写+翻译+HyDE → 混合检索（dense+sparse）→ RRF 融合 → Reranker 重排 → LLM 生成带角标答案
 
@@ -106,113 +162,100 @@ async def list_messages(id: int):
 - `event: token` — 流式文字 delta
 - `event: done` — 结束，含 latency_ms
 
-**scope_type**：`all`=全库，`folder`=指定文件夹，`papers`=指定论文列表""")
+**scope_type**：`all`=全库，`folder`=指定文件夹，`papers`=指定论文列表""",
+)
 async def chat_query(
-    conversation_id: int,
+    conversation_id: str,
     question: str,
     scope_type: str = "all",
     scope_ids: Optional[str] = None,
+    current: Dict[str, Any] = Depends(get_current_user_sse),
 ):
-    # SSE 必须经 GET 暴露：前端用 EventSource(只支持 GET)。参数走 query string，
-    # 与 frontend chatAPI.getQuerySSEUrl 构造的 URL 对齐。
-    # Streaming Response Generator for SSE
+    svc = get_chat_service()
+    t0 = time.perf_counter()
+
     async def sse_generator():
-        tokens = [
-            "根据", "先前", "有关", " RAG ", "的研究", " ", 
-            "**Attention Is All You Need**", " [1] ", "中", "提出", "的", 
-            " Transformer ", "架构，", "多头", "注意力", "机制", "大大", 
-            "增强了", "序列", "特征", "的", "建模", "能力。", 
-            "对于", "多文档", "及", "复杂", "对比", "任务，", "通常", 
-            "结合", "混合", "检索", " [2] ", "能够", "召回", "更", "精准", "的信息。"
-        ]
-        
-        # 1. Yield citation information first or early
-        cites = [
-            {
-                "paper_id": 1,
-                "paper_title": "Attention Is All You Need",
-                "page_num": 3,
-                "bbox": "[3, 100, 200, 500, 300]",
-                "chunk_type": "text",
-                "content": "We propose the Transformer, a model architecture eschewing recurrence and instead relying entirely on an attention mechanism to draw global dependencies between input and output.",
-                "image_key": None
-            },
-            {
-                "paper_id": 2,
-                "paper_title": "Retrieval-Augmented Generation for NLP Tasks",
-                "page_num": 5,
-                "bbox": "[5, 50, 80, 480, 220]",
-                "chunk_type": "table",
-                "content": '<table border="1" class="mock-table"><tr><th>Model</th><th>Accuracy</th></tr><tr><td>Dense Retrieve</td><td>44.2%</td></tr><tr><td>Hybrid (RRF)</td><td>51.8%</td></tr></table>',
-                "image_key": "fig_dataset_comparison"
-            }
-        ]
-        
-        for c in cites:
-            await asyncio.sleep(0.1)
-            yield f"event: cite\ndata: {json.dumps(c)}\n\n"
-            
-        # 2. Yield text tokens
-        for t in tokens:
-            await asyncio.sleep(0.08)
-            payload = {"delta": t}
-            yield f"event: token\ndata: {json.dumps(payload)}\n\n"
-            
-        # 3. Yield done event
-        await asyncio.sleep(0.1)
-        yield "event: done\ndata: {\"latency_ms\": 652}\n\n"
+        try:
+            request = AgentChatRequest(
+                conv_id=conversation_id,
+                query=question,
+                stream=True,
+            )
+            async for line in svc.query(request, user_id=_user_id_from_auth(current)):
+                # ChatService yields JSON lines: {"event": "...", "data": {...}}
+                try:
+                    event_obj = json.loads(line)
+                except json.JSONDecodeError:
+                    # raw text fallback
+                    yield f"event: token\ndata: {json.dumps({'delta': line})}\n\n"
+                    continue
 
-    # Add the query to history mock database
-    if conversation_id in MOCK_MESSAGES:
-        # Mocking user message adding
-        user_msg = MessageResponse(
-            id=int(datetime.now().timestamp() * 1000),
-            conversation_id=conversation_id,
-            role="user",
-            content=question,
-            citations=[],
-            created_at=datetime.now()
-        )
-        MOCK_MESSAGES[conversation_id].append(user_msg)
-        
-        # Mocking assistant message adding (will be complete after stream)
-        assistant_content = "根据先前有关 RAG 的研究 Attention Is All You Need [1] 中提出的 Transformer 架构，多头注意力机制大大增强了序列特征的建模能力。对于多文档及复杂对比任务，通常结合混合检索 [2] 能够召回更精准的信息。"
-        assistant_msg = MessageResponse(
-            id=int(datetime.now().timestamp() * 1000) + 1,
-            conversation_id=conversation_id,
-            role="assistant",
-            content=assistant_content,
-            citations=[
-                CitationResponse(
-                    paper_id=1,
-                    paper_title="Attention Is All You Need",
-                    page_num=3,
-                    bbox="[3, 100, 200, 500, 300]",
-                    chunk_type="text",
-                    content="We propose the Transformer, a model architecture eschewing recurrence and instead relying entirely on an attention mechanism to draw global dependencies between input and output.",
-                    image_key=None
-                ),
-                CitationResponse(
-                    paper_id=2,
-                    paper_title="Retrieval-Augmented Generation for NLP Tasks",
-                    page_num=5,
-                    bbox="[5, 50, 80, 480, 220]",
-                    chunk_type="table",
-                    content='<table border="1" class="mock-table"><tr><th>Model</th><th>Accuracy</th></tr><tr><td>Dense Retrieve</td><td>44.2%</td></tr><tr><td>Hybrid (RRF)</td><td>51.8%</td></tr></table>',
-                    image_key="fig_dataset_comparison"
-                )
-            ],
-            created_at=datetime.now()
-        )
-        MOCK_MESSAGES[conversation_id].append(assistant_msg)
+                event_type = event_obj.get("event", "token")
+                data = event_obj.get("data", {})
 
-    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+                # Map ChatService data → frontend-expected format
+                if event_type == "token":
+                    # ChatService uses "content", frontend expects "delta"
+                    text = data.get("content") or data.get("delta") or ""
+                    yield f"event: token\ndata: {json.dumps({'delta': text})}\n\n"
 
-@router.post("/feedback", response_model=FeedbackResponse,
-             summary="答案反馈（点赞/踩）",
-             description="对 assistant 回答进行正负反馈，数据写入 query_logs 用于后续质量分析。`is_positive=true` 为点赞，`false` 为踩，可附带原因说明。")
-async def message_feedback(data: FeedbackRequest):
-    return FeedbackResponse(
-        status="success",
-        message="Feedback saved successfully. Thank you for your feedback!"
+                elif event_type == "cite":
+                    yield f"event: cite\ndata: {json.dumps(data)}\n\n"
+
+                elif event_type == "done":
+                    latency_ms = int((time.perf_counter() - t0) * 1000)
+                    done_data = data.copy()
+                    done_data["latency_ms"] = latency_ms
+                    yield f"event: done\ndata: {json.dumps(done_data)}\n\n"
+
+                elif event_type == "error":
+                    logger.error(f"Chat query error: {data}")
+                    yield f"event: error\ndata: {json.dumps(data)}\n\n"
+
+                else:
+                    # Unknown event → forward as-is
+                    yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+        except Exception as e:
+            logger.error(f"SSE generator error: {e}")
+            yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. POST /feedback — save feedback
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/feedback",
+    response_model=FeedbackResponse,
+    summary="答案反馈（点赞/踩）",
+    description="对 assistant 回答进行正负反馈，数据写入 query_logs。is_positive=true 为点赞，false 为踩，可附带原因说明。",
+)
+async def message_feedback(
+    data: FeedbackRequest,
+    current: Dict[str, Any] = Depends(get_current_user),
+):
+    svc = get_chat_service()
+    try:
+        await svc.save_feedback(
+            message_id=data.message_id,
+            is_positive=data.is_positive,
+            reason=data.reason or "",
+            user_id=_user_id_from_auth(current),
+        )
+        return FeedbackResponse(
+            status="success",
+            message="Feedback saved successfully. Thank you for your feedback!",
+        )
+    except DatabaseException as e:
+        raise HTTPException(status_code=500, detail=str(e))

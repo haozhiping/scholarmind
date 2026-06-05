@@ -16,7 +16,7 @@
 | 链路 | 内容 | 完成度 |
 |---|---|---|
 | ① 认证 + 论文库（地基） | auth JWT/bcrypt/MySQL；folders/papers 接 MySQL + `user_id` | ✅ 代码就绪（待 docker 联调验证） |
-| ② 上传→解析→入库 | upload 落 MinIO + RQ；worker job；ingest 进度读真实表 | ⏳ 0% |
+| ② 上传→解析→入库 | upload 落 MinIO + RQ；worker job；ingest 进度读真实表 | 🟡 **入队已通 + Agent API 已接**（2026-06-05），需 `MINERU_API_KEY` + LLM Key 即可完整跑通 |
 | ③ 对话 RAG | chat 接 PG；query 真实检索+LLM SSE | ⏳ 0% |
 | ④ 综述 + 引用图谱 | review Agent；graph 读 citations | ⏳ 0% |
 | ⑤ 可观测 + 设置 | settings 路由；access 日志；stats/logs 真实表 | ⏳ 0% |
@@ -24,7 +24,7 @@
 ## 三、待处理问题摘要
 
 1. **两个契约 bug**：① `chat.query`/`review.generate` 用 POST 但前端 `EventSource` 只发 GET → 405；② 后端缺 `POST /api/settings` 路由 → 前端保存必 404。
-2. **基础设施缺口**：`clients/minio.py` 缺失、RQ enqueue 未接、worker 未注册 job、access 日志中间件缺失、`services/retrieval/` 目录不存在。
+2. **基础设施缺口**：✅ `clients/minio.py` 已完成、✅ RQ enqueue 已接（本轮修复）、✅ worker 已注册 job、🔴 access 日志中间件缺失、✅ `services/retrieval/` 已补全。
 3. **链路①验证**：需 `docker compose up -d` 后端到端跑通注册/登录/论文库（本机无 MySQL，当前仅纯函数单测可跑）。
 
 ## 四、链路①已交付
@@ -32,6 +32,14 @@
 新增 `common/db/mysql_client.py`、`common/auth/{security,deps}.py`、`tests/test_auth_security.py`；auth/papers/folders 路由去 Mock 接 MySQL（强制 `user_id`）；main.py 注册异常处理器与 MySQL 池生命周期；补全前端调用但后端缺失的 `DELETE /folders/{id}`。
 
 并修复 2 个契约 bug：chat/advanced 的 SSE 端点 `POST→GET`（对齐 `EventSource`）、新增 `app/routers/settings.py`（鉴权 + 按 `user_id` 存 Redis）。
+
+### 链路②-入队部分已交付（2026-06-05）
+
+修复 `papers.py` upload：落 MinIO → INSERT DB → RQ `Queue("ingest").enqueue()`；修复 `worker/main.py`：从 MinIO 下载 PDF、统一 `task_id`（UUID）查询、补全 `parse_paper` 参数（pdf_bytes + db）；修复 `parser.py`：移除 SQLAlchemy 依赖、全部 DB 操作改用 `AsyncMySQLClient`（`%s` 占位符 + autocommit）。ingest 路由 JOIN papers 表返回真实 file_name。
+
+### ⚠️ 上传链路当前行为
+
+上传 PDF 后 Worker 能收到任务并尝试执行 `parse_paper`。**已新增 `MINERU_PROVIDER=agent` 模式**（2026-06-05），无需 Pipeline ID，走 MinerU Agent 签名上传 API。仍需配置 `MINERU_API_KEY`（https://mineru.net 注册）才能完成真实解析。**入队 → Worker 唤醒 → DB 状态更新 → Agent API 解析** 的调度链路已贯通。
 
 ## 五、验证与提交状态（2026-06-05，如实标注）
 

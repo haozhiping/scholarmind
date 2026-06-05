@@ -30,7 +30,7 @@
         <h1>论文文献库</h1>
         <div class="user-profile">
           <span class="avatar">👤</span>
-          <span class="username">项目成员</span>
+          <span class="username">{{ authStore.user?.username || '项目成员' }}</span>
         </div>
       </header>
 
@@ -105,7 +105,7 @@
               <tbody>
                 <tr v-for="paper in filteredPapers" :key="paper.id">
                   <td class="paper-title" @click="openPaper(paper)">{{ paper.title }}</td>
-                  <td>{{ paper.authors?.join(', ') || '未知' }}</td>
+                  <td>{{ Array.isArray(paper.authors) ? paper.authors.join(', ') : paper.authors || '未知' }}</td>
                   <td>{{ paper.year || '-' }}</td>
                   <td>
                     <span :class="['status-badge', paper.status]">
@@ -278,7 +278,7 @@ async function loadPapers() {
     papers.value = res.data.map((paper: any) => ({
       id: paper.id,
       title: paper.title,
-      authors: paper.authors ? (typeof paper.authors === 'string' ? paper.authors.split(', ') : paper.authors) : ['未知'],
+      authors: paper.authors ? (typeof paper.authors === 'string' ? paper.authors.split(', ').filter(Boolean) : Array.isArray(paper.authors) ? paper.authors : [paper.authors]) : ['未知'],
       year: paper.year,
       status: paper.status,
       created_at: new Date(paper.created_at).toLocaleString('zh-CN'),
@@ -732,7 +732,7 @@ td {
   font-weight: 600;
 }
 
-.status-badge.done {
+.status-badge.done, .status-badge.completed {
   background-color: #d1f2d9;
   color: #0f6c2c;
 }

@@ -167,7 +167,7 @@ interface Citation {
 }
 
 interface Message {
-  id: number;
+  id: string;
   role: string;
   content: string;
   citations: Citation[];
@@ -183,7 +183,7 @@ const streamingText = ref('');
 const messageListRef = ref<HTMLDivElement | null>(null);
 
 const activeCitation = ref<Citation | null>(null);
-const currentConversationId = ref<number | null>(null);
+const currentConversationId = ref<string | null>(null);
 const citationsBuffer = ref<Citation[]>([]);
 
 const blockTypeMap: Record<string, string> = {
@@ -195,7 +195,7 @@ const blockTypeMap: Record<string, string> = {
 
 const messages = ref<Message[]>([
   {
-    id: 1,
+    id: '00000000-0000-0000-0000-000000000000',
     role: 'assistant',
     content: '您好！我是您的跨语言文献调研助手"文渊"。请问有什么关于论文、公式或图表的问题我可以帮您解答？',
     citations: [],
@@ -248,7 +248,7 @@ async function sendMessage() {
 
   // 1. Add User Message
   messages.value.push({
-    id: Date.now(),
+    id: Date.now().toString(),
     role: 'user',
     content: userText,
     citations: [],
@@ -305,7 +305,7 @@ function connectSSE(url: string) {
       const finalContent = processCitationsInText(streamingText.value, citationsBuffer.value);
       
       messages.value.push({
-        id: Date.now() + 1,
+        id: (Date.now() + 1).toString(),
         role: 'assistant',
         content: finalContent,
         citations: [...citationsBuffer.value],

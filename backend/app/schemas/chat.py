@@ -8,7 +8,7 @@ class ConversationCreate(BaseModel):
     paper_ids: Optional[List[int]] = None
 
 class ConversationResponse(BaseModel):
-    id: int
+    id: str                       # UUID (conv_id from ChatService)
     title: str
     folder_id: Optional[int] = None
     paper_ids: Optional[List[int]] = None
@@ -16,31 +16,31 @@ class ConversationResponse(BaseModel):
     updated_at: datetime
 
 class CitationResponse(BaseModel):
-    paper_id: int
+    paper_id: int                 # maps to MySQL papers.id (BIGINT)
     paper_title: str
     page_num: int
     bbox: str
-    chunk_type: str  # "text", "table", "figure", "formula"
+    chunk_type: str               # "text", "table", "figure", "formula"
     content: str
     image_key: Optional[str] = None
 
 class MessageResponse(BaseModel):
-    id: int
-    conversation_id: int
-    role: str  # "user", "assistant"
+    id: str                       # UUID (msg_id from ChatService)
+    conversation_id: str          # UUID (conv_id)
+    role: str                     # "user", "assistant"
     content: str
     citations: Optional[List[CitationResponse]] = None
     created_at: datetime
 
 class ChatQueryRequest(BaseModel):
     question: str
-    conversation_id: int
-    scope_type: str = "all"  # "all", "folder", "papers"
+    conversation_id: str          # UUID
+    scope_type: str = "all"       # "all", "folder", "papers"
     folder_id: Optional[int] = None
     paper_ids: Optional[List[int]] = None
 
 class FeedbackRequest(BaseModel):
-    message_id: int
+    message_id: str               # UUID
     is_positive: bool
     reason: Optional[str] = None
 

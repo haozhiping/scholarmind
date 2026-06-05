@@ -208,7 +208,7 @@ async function loadActiveTasks() {
     const res = await observabilityAPI.getActiveTasks();
     activeTasks.value = res.data.map((task: any) => ({
       id: task.id,
-      file_name: `Task ${task.id}`, // In real scenario, get from paper info
+      file_name: task.file_name || task.id,
       stage: task.stage,
       progress: task.progress || 0,
       started_at: new Date(task.updated_at || Date.now()).toLocaleString('zh-CN'),
@@ -225,12 +225,12 @@ async function loadQueryLogs() {
     queryLogs.value = res.data.map((log: any) => ({
       id: log.id,
       question: log.question,
-      rewritten_query: log.rewritten_query,
+      rewritten_query: log.rewritten_query || null,
       latency_ms: log.latency_ms,
-      prompt_tokens: log.tokens_used || 0,
-      completion_tokens: 0, // Not available in backend schema
+      prompt_tokens: log.prompt_tokens || log.tokens_used || 0,
+      completion_tokens: log.completion_tokens || 0,
       retrieved_chunk_ids: log.retrieved_chunk_ids || [],
-      feedback: log.feedback,
+      feedback: log.feedback || 0,
     }));
   } catch (error: any) {
     console.error('Failed to load query logs:', error);

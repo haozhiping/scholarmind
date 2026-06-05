@@ -42,7 +42,7 @@ app = FastAPI(
 # Set up CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust in production
+    allow_origins=["http://localhost:5173", "http://localhost:8008"],  # Vite dev + production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

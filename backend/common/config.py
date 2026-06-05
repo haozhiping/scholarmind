@@ -90,10 +90,20 @@ class Settings(BaseSettings):
     REFERENCE_PARSER_PROVIDER: str = "llm"
     GROBID_BASE_URL: str = "http://grobid:8070"
 
-    # MinerU KIE cloud SDK (mineru-kie-sdk)
+    # MinerU 解析器选择: "agent" (轻量 Agent API, 默认) | "kie" (KIE SDK, 需 Pipeline ID)
+    MINERU_PROVIDER: str = "agent"
+
+    # MinerU Agent 轻量解析 API (https://mineru.net/api/v1/agent)
+    MINERU_AGENT_BASE_URL: str = "https://mineru.net/api/v1/agent"
+    MINERU_API_KEY: str = ""              # Agent API 鉴权 token (Header: Authorization: Bearer xxx)
+    MINERU_LANGUAGE: str = "ch"           # 文档语言: ch / en
+    MINERU_ENABLE_TABLE: bool = True
+    MINERU_ENABLE_FORMULA: bool = True
+    MINERU_IS_OCR: bool = False
+
+    # MinerU KIE cloud SDK (mineru-kie-sdk, 需要 Pipeline ID)
     MINERU_KIE_BASE_URL: str = "https://mineru.net/api/kie"
     MINERU_PIPELINE_ID: str = ""          # required for cloud parsing
-    MINERU_API_KEY: str = ""              # reserved, used per SDK auth
     MINERU_POLL_INTERVAL: int = 5         # seconds between polls
     MINERU_TIMEOUT: int = 300             # total poll timeout (s); -1 = until done
 

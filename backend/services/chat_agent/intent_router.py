@@ -1,7 +1,7 @@
 import json
 from typing import List, Dict, Any, Optional
 from .prompts import INTENT_ROUTER_PROMPT
-from ...common.clients.llm import AsyncLLMClient
+from common.clients.llm import AsyncLLMClient
 
 class IntentRouter:
     def __init__(self, llm_client: Optional[AsyncLLMClient] = None):

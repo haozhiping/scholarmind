@@ -930,7 +930,7 @@ git commit -m "feat(parsing): worker handle_ingest_job 驱动解析全流程
 ## Task 8: 验证文档 + 收尾
 
 **Files:**
-- Create: `check/ingest端到端入库链路-验证报告.md`
+- Create: `docs/STATUS.md`（更新入库链路验证记录）
 
 - [ ] **Step 1: 运行完整测试套件**
 
@@ -939,7 +939,7 @@ Run: `python -m pytest tests -v`
 
 - [ ] **Step 2: 编写验证报告**
 
-Create `check/ingest端到端入库链路-验证报告.md` documenting:
+Create `docs/STATUS.md` documenting:
 - 实现摘要（3 客户端 + upload + ingest + worker 各做了什么）
 - 数据流图（上传→入队→worker→解析落库）
 - 离线单测覆盖项 + `python -m pytest tests` 结果
@@ -952,8 +952,8 @@ Create `check/ingest端到端入库链路-验证报告.md` documenting:
 - [ ] **Step 3: 提交**
 
 ```bash
-git add "check/ingest端到端入库链路-验证报告.md"
-git commit -m "docs: 新增 ingest 端到端入库链路验证报告
+git add docs/STATUS.md
+git commit -m "docs: 更新 STATUS.md 记录 ingest 端到端入库链路验证结果
 
 记录三客户端+upload+ingest+worker 实现、数据流、离线单测覆盖与结果、
 Docker 待验证项、MinIO 重复技术债与 user_id 常量待替换说明。"
@@ -977,7 +977,7 @@ If worth persisting, append to `MEMORY.md` a line about: RQ worker 同步进程�
 - config MYSQL_POOL_SIZE → Task 1 ✅
 - 错误矩阵（单文件失败/幂等/worker 异常/404/非failed retry）→ Task 5/6/7 测试与实现 ✅
 - 多租户 user_id 过滤 → 所有 SQL 带 user_id（upload/worker papers 更新）✅
-- check/ 验证文档 → Task 8 ✅
+- docs/STATUS.md 验证文档 → Task 8 ✅
 - 测试策略（离线 + Docker 待验证标注）→ Task 2-7 单测 + Task 8 文档 ✅
 
 **Placeholder scan:** 无 TBD/TODO；每个改代码步骤含完整代码。

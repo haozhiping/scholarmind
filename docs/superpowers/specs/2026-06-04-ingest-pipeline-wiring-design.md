@@ -153,7 +153,7 @@ MYSQL_POOL_SIZE: int = 10
   - redis：mock `Redis`/`Queue`，`get_queue` 返回 name='ingest' 的 Queue。
 - `test_upload_route.py`：FastAPI `TestClient`，`app.dependency_overrides[get_session]` 注入 `AsyncMock` 会话（`execute` 返回带 `lastrowid` 的 MagicMock），monkeypatch `upload_bytes` 与 `get_queue`。断言 202、响应含 batch_id/tasks、enqueue 被调用、幂等命中跳过 enqueue。ingest GET：注入 mock 会话返回行，断言映射。
 - `test_worker_handler.py`：monkeypatch `session_scope`(返回 async 上下文管理器包 AsyncMock)、`download_bytes`、`parse_paper`(AsyncMock)。断言 stage 流转（parsing→done）、`parse_paper` 收到 `pdf_bytes`；异常路径断言 failed 更新与 re-raise。
-- Docker 待验证项写入 `check/`：真实三件套连通、RQ fork 行为（Linux 容器）、端到端上传一篇 PDF 看 papers/doc_blocks/figures 落地。
+- Docker 待验证项写入 `docs/STATUS.md`：真实三件套连通、RQ fork 行为（Linux 容器）、端到端上传一篇 PDF 看 papers/doc_blocks/figures 落地。
 
 ## 7. 验收标准
 - [ ] `POST /papers/upload` 落 papers/ingest_batches/ingest_tasks 真实行，传 PDF 到 MinIO，入 RQ `ingest` 队列，202 返回 batch_id/tasks。
@@ -161,4 +161,4 @@ MYSQL_POOL_SIZE: int = 10
 - [ ] worker `handle_ingest_job` 取 PDF 字节 → `parse_paper` → ingest_tasks 流转 queued→parsing→done；异常置 failed。
 - [ ] `GET /ingest/batches/{id}`、`GET /ingest/tasks` 返回真实库数据；retry 重入队。
 - [ ] 所有 DB 写入/查询带 `user_id`（多租户铁律）。
-- [ ] 离线单测全绿；Docker 待验证项在 `check/` 文档列明。
+- [ ] 离线单测全绿；Docker 待验证项在 `docs/STATUS.md` 列明。

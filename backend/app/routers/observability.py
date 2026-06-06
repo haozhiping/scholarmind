@@ -77,7 +77,7 @@ async def list_query_logs(
     offset: int = 0,
     current: Dict[str, Any] = Depends(get_current_user),
 ):
-    rows = await mysql.fetch(
+    rows = await mysql.fetchall(
         """
         SELECT id, user_id, question, rewritten_query, retrieved_chunk_ids,
                latency_ms, prompt_tokens, completion_tokens, feedback, created_at
@@ -106,7 +106,7 @@ async def list_access_logs(
     offset: int = 0,
     current: Dict[str, Any] = Depends(get_current_user),
 ):
-    rows = await mysql.fetch(
+    rows = await mysql.fetchall(
         """
         SELECT id, user_id, method, path, status_code, ip, latency_ms, created_at
         FROM access_logs

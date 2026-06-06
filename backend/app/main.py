@@ -8,6 +8,7 @@ from common.config import settings
 from common.logging import logger
 from common.exceptions import AppException, exception_handler, generic_exception_handler
 from common.db.mysql_client import mysql
+from common.db.migrations import run_migrations
 
 from app.routers.auth import router as auth_router
 from app.routers.papers import router as papers_router, folders_router
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
     try:
         await mysql.connect()
         logger.info("MySQL pool initialized")
+        await run_migrations()
     except Exception as e:  # noqa: BLE001 - log and continue;健康检查仍可用
         logger.error(f"MySQL pool init failed: {e}")
     yield

@@ -157,7 +157,9 @@ async def _call_mineru_agent(pdf_bytes: bytes) -> dict:
     """
     import time
 
-    headers = {"Content-Type": "application/json"}
+    # MinerU Agent API now requires an API key.
+    # If MINERU_API_KEY is empty, the server returns "user authenticate failed".
+    headers: dict[str, str] = {"Content-Type": "application/json"}
     if settings.MINERU_API_KEY:
         headers["Authorization"] = f"Bearer {settings.MINERU_API_KEY}"
 
@@ -238,8 +240,12 @@ def _sync_mineru_kie_call(pdf_bytes: bytes) -> dict:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp.write(pdf_bytes)
             tmp_path = tmp.name
-        client.upload_file(tmp_path)
+        file_ids = client.upload_file(tmp_path)
+        if not file_ids:
+            raise RuntimeError("MinerU KIE upload_file returned empty file_ids")
+        logger.debug(f"[parse-kie] uploaded file, file_ids={file_ids}")
         results = client.get_result(
+            file_ids=file_ids,
             timeout=settings.MINERU_TIMEOUT,
             poll_interval=settings.MINERU_POLL_INTERVAL,
         )
@@ -521,6 +527,14 @@ async def parse_paper(
     # --- Step 4: VLM descriptions (needs image_key set) ---
     await _describe_figures(blocks)
 
+    # VLM descriptions are computed after _write_blocks — backfill content_zh now
+    for b in blocks:
+        if b.block_type == "figure" and b.content_zh:
+            await db.execute(
+                "UPDATE doc_blocks SET content_zh=%s WHERE id=%s AND user_id=%s",
+                b.content_zh, b.block_id, user_id,
+            )
+
     # --- Step 5: reference extraction ---
     if settings.REFERENCE_PARSER_PROVIDER == "grobid":
         references = await _extract_refs_grobid(pdf_bytes)
@@ -608,9 +622,9 @@ async def _write_blocks(user_id: int, paper_id: int, blocks: list[Block], db) ->
     for b in blocks:
         bbox_json = json.dumps(b.bbox) if b.bbox else None
         block_id = await db.execute(
-            "INSERT INTO doc_blocks (paper_id, user_id, block_type, content, page_num, bbox, image_key) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            paper_id, user_id, b.block_type, b.content, b.page_num, bbox_json, b.image_key,
+            "INSERT INTO doc_blocks (paper_id, user_id, block_type, content, content_zh, page_num, bbox, image_key) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            paper_id, user_id, b.block_type, b.content, b.content_zh, b.page_num, bbox_json, b.image_key,
         )
         b.block_id = block_id
 

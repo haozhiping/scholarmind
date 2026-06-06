@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS doc_blocks (
   user_id     BIGINT NOT NULL,
   block_type  VARCHAR(16) NOT NULL,               -- text|table|figure|formula
   content     LONGTEXT NULL,                       -- table->HTML, formula->LaTeX, figure->caption
+  content_zh  TEXT NULL,                            -- VLM 中文图描述（figure blocks only）
   page_num    INT NULL,
   bbox        JSON NULL,                           -- [page,left,top,right,bottom]
   image_key   VARCHAR(256) NULL,

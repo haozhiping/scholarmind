@@ -174,7 +174,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, watch } from 'vue';
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { papersAPI, foldersAPI, ingestAPI } from '../api';
@@ -242,17 +242,44 @@ function triggerFileSelect() {
   fileInput.value?.click();
 }
 
+// Polling management
+let pollIntervalId: ReturnType<typeof setInterval> | null = null;
+const TERMINAL_STATUSES = new Set(['done', 'completed', 'failed']);
+
+function allPapersTerminal(): boolean {
+  return papers.value.length > 0 && papers.value.every(p => TERMINAL_STATUSES.has(p.status));
+}
+
+function startPolling() {
+  stopPolling(); // ensure no duplicate intervals
+  pollIntervalId = setInterval(async () => {
+    if (currentBatchId.value) {
+      await loadPapers();
+      // Stop when every paper has reached a terminal state
+      if (allPapersTerminal()) {
+        stopPolling();
+      }
+    }
+  }, 3000);
+}
+
+function stopPolling() {
+  if (pollIntervalId !== null) {
+    clearInterval(pollIntervalId);
+    pollIntervalId = null;
+  }
+  currentBatchId.value = null;
+}
+
 // Load folders and papers on mount
 onMounted(async () => {
   await loadFolders();
   await loadPapers();
-  
-  // Poll for upload progress every 3 seconds
-  setInterval(async () => {
-    if (currentBatchId.value) {
-      await loadPapers();
-    }
-  }, 3000);
+  startPolling();
+});
+
+onUnmounted(() => {
+  stopPolling();
 });
 
 // Reload papers when folder selection changes
@@ -364,8 +391,9 @@ async function uploadFiles(files: FileList) {
     loading.value = true;
     const res = await papersAPI.uploadPapers(files, selectedFolderId.value ?? undefined);
     
-    // Store batch_id for polling
+    // Store batch_id for polling & restart polling
     currentBatchId.value = res.data.batch_id;
+    startPolling();
     
     // Show upload success
     alert(`已上传 ${files.length} 个文件，正在后台解析中...`);
@@ -374,7 +402,26 @@ async function uploadFiles(files: FileList) {
     await loadPapers();
   } catch (error: any) {
     console.error('Failed to upload papers:', error);
-    alert('上传失败，请稍后重试');
+    console.error('Upload error details:', {
+      code: error?.code,
+      message: error?.message,
+      hasResponse: !!error?.response,
+      status: error?.response?.status,
+      statusText: error?.response?.statusText,
+      responseData: error?.response?.data,
+      fileName: files[0]?.name,
+      fileSize: files[0]?.size,
+    });
+    if (error?.code === 'ECONNABORTED') {
+      alert('上传超时，PDF 文件过大或网络较慢，请重试');
+    } else if (error?.code === 'ERR_NETWORK') {
+      alert('网络错误，请检查后端服务是否正常运行（localhost:8008）');
+    } else if (error?.code === 'ERR_BAD_RESPONSE') {
+      alert('服务器响应异常，请查看后端日志');
+    } else {
+      const detail = error?.response?.data?.detail || error?.message || '未知错误';
+      alert(`上传失败：${detail}`);
+    }
   } finally {
     loading.value = false;
   }

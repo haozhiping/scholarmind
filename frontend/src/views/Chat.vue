@@ -36,7 +36,7 @@
         </header>
 
         <!-- Message List -->
-        <div class="message-list" ref="messageListRef">
+        <div class="message-list" ref="messageListRef" @click="onMessageClick">
           <div 
             v-for="msg in messages" 
             :key="msg.id" 
@@ -151,7 +151,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, onMounted } from 'vue';
+import { ref, nextTick, onMounted, onUnmounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { chatAPI } from '../api';
@@ -181,6 +181,7 @@ const inputQuery = ref('');
 const streaming = ref(false);
 const streamingText = ref('');
 const messageListRef = ref<HTMLDivElement | null>(null);
+let abortController: AbortController | null = null;
 
 const activeCitation = ref<Citation | null>(null);
 const currentConversationId = ref<string | null>(null);
@@ -211,6 +212,13 @@ onMounted(async () => {
   
   // Try to create or load conversation
   await initConversation();
+});
+
+onUnmounted(() => {
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
 });
 
 async function initConversation() {
@@ -260,81 +268,137 @@ async function sendMessage() {
   streaming.value = true;
   streamingText.value = '';
   
-  const sseUrl = chatAPI.getQuerySSEUrl(currentConversationId.value, userText);
-  connectSSE(sseUrl);
+  connectSSE(currentConversationId.value, userText);
 }
 
-function connectSSE(url: string) {
-  const eventSource = new EventSource(url);
-  
-  eventSource.onmessage = (e) => {
-    // Default message handler (shouldn't happen with proper SSE)
-    console.log('SSE message:', e.data);
-  };
-  
-  eventSource.addEventListener('cite', (e) => {
+function handleSSEEvent(event: string, data: string) {
+  if (event === 'cite') {
     try {
-      const citation: Citation = JSON.parse(e.data);
+      const citation: Citation = JSON.parse(data);
       citationsBuffer.value.push(citation);
-      console.log('Received citation:', citation);
-    } catch (error) {
-      console.error('Failed to parse citation:', error);
+    } catch (err) {
+      console.error('Failed to parse citation:', err);
     }
-  });
-  
-  eventSource.addEventListener('token', (e) => {
+  } else if (event === 'token') {
     try {
-      const data = JSON.parse(e.data);
-      const delta = data.delta || '';
-      streamingText.value += delta;
+      const parsed = JSON.parse(data);
+      streamingText.value += parsed.delta || '';
       scrollToBottom();
-    } catch (error) {
-      console.error('Failed to parse token:', error);
+    } catch (err) {
+      console.error('Failed to parse token:', err);
     }
-  });
-  
-  eventSource.addEventListener('done', (e) => {
+  } else if (event === 'done') {
     try {
-      const data = JSON.parse(e.data);
-      console.log('Stream completed:', data);
-      
-      // Close SSE connection
-      eventSource.close();
-      
-      // Save final message with citations
       const finalContent = processCitationsInText(streamingText.value, citationsBuffer.value);
-      
       messages.value.push({
         id: (Date.now() + 1).toString(),
         role: 'assistant',
         content: finalContent,
         citations: [...citationsBuffer.value],
       });
-      
       streamingText.value = '';
       streaming.value = false;
       scrollToBottom();
-    } catch (error) {
-      console.error('Failed to parse done event:', error);
-      eventSource.close();
+    } catch (err) {
+      console.error('Failed to parse done event:', err);
       streaming.value = false;
     }
-  });
-  
-  eventSource.addEventListener('error', (e) => {
-    console.error('SSE error:', e);
-    eventSource.close();
+  } else if (event === 'error') {
     streaming.value = false;
     alert('连接中断，请稍后重试');
+  }
+}
+
+async function connectSSE(conversationId: string, question: string) {
+  const url = chatAPI.getQuerySSEUrl(conversationId, question);
+  const token = localStorage.getItem('token');
+  abortController = new AbortController();
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        Accept: 'text/event-stream',
+      },
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`SSE connection failed: ${response.status}`);
+    }
+    if (!response.body) {
+      throw new Error('ReadableStream not supported in this browser');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      let currentEvent = '';
+      let currentData = '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          currentData = line.slice(6);
+        } else if (line === '' && currentEvent) {
+          handleSSEEvent(currentEvent, currentData);
+          currentEvent = '';
+          currentData = '';
+        }
+      }
+    }
+  } catch (error: any) {
+    if (error.name !== 'AbortError') {
+      console.error('SSE error:', error);
+      streaming.value = false;
+      alert('连接中断，请稍后重试');
+    }
+  }
+}
+
+// Replace [N] markers with clickable <span> elements that show citation details
+function processCitationsInText(text: string, citations: Citation[]): string {
+  if (!citations.length) return text;
+  return text.replace(/\[(\d+)\]/g, (_match, num) => {
+    const idx = parseInt(num, 10) - 1;
+    if (idx >= 0 && idx < citations.length) {
+      return `<span class="cite-marker" data-cite-idx="${idx}">[${num}]</span>`;
+    }
+    return _match;
   });
 }
 
-// Process text to add clickable citation markers
-function processCitationsInText(text: string, citations: Citation[]): string {
-  // Simple version: just return the text as-is
-  // Citations are shown in the footer already
-  // Advanced version could parse [1], [2] markers and make them clickable
-  return text;
+// Event delegation: clicking a [N] marker shows the citation detail in the right panel
+function onMessageClick(e: MouseEvent) {
+  const target = e.target as HTMLElement;
+  if (!target.classList.contains('cite-marker')) return;
+
+  const citeIdx = parseInt(target.dataset.citeIdx || '', 10);
+  if (isNaN(citeIdx)) return;
+
+  const msgEl = target.closest('.message-item') as HTMLElement | null;
+  if (!msgEl || !messageListRef.value) return;
+
+  // Determine which message this citation belongs to
+  // (DOM order mirrors messages array order, and .typing has no clickable markers)
+  const items = messageListRef.value.querySelectorAll(':scope > .message-item');
+  const msgIndex = Array.from(items).indexOf(msgEl);
+  if (msgIndex < 0 || msgIndex >= messages.value.length) return;
+
+  const msg = messages.value[msgIndex];
+  if (!msg.citations || citeIdx >= msg.citations.length) return;
+
+  showCitationDetail(msg.citations[citeIdx]);
 }
 
 async function scrollToBottom() {
@@ -530,6 +594,23 @@ async function scrollToBottom() {
 .message-content {
   font-size: 14px;
   line-height: 1.6;
+}
+
+.message-content :deep(.cite-marker) {
+  display: inline-block;
+  color: #1c7243;
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: none;
+  padding: 0 1px;
+  transition: all 0.2s ease;
+}
+
+.message-content :deep(.cite-marker:hover) {
+  color: #a2f26d;
+  background-color: #0f3d24;
+  border-radius: 3px;
+  text-decoration: underline;
 }
 
 .message-content :deep(strong) {

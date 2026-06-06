@@ -16,6 +16,11 @@ api.interceptors.request.use(
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`;
     }
+    // For FormData (file upload), let browser auto-set Content-Type with boundary.
+    // The global default 'application/json' would otherwise block multipart uploads.
+    if (config.data instanceof FormData) {
+      delete (config.headers as Record<string, unknown>)['Content-Type'];
+    }
     return config;
   },
   (error) => {
@@ -60,7 +65,7 @@ export const papersAPI = {
       formData.append('folder_id', folderId.toString());
     }
     return api.post('/api/papers/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 300000, // 5 min timeout for large PDF uploads
     });
   },
   
@@ -125,8 +130,7 @@ export const chatAPI = {
   getMessages: (conversationId: string) => 
     api.get(`/api/chat/conversations/${conversationId}/messages`),
   
-  // SSE chat query (returns EventSource URL)
-  // EventSource 不支持自定义 Header，因此通过 query 参数传递 JWT token
+  // SSE chat query URL（token 走 Authorization Header，不走 URL query）
   getQuerySSEUrl: (conversationId: string, question: string, scopeType: string = 'all', scopeIds?: number[]) => {
     const params = new URLSearchParams();
     params.append('conversation_id', conversationId.toString());
@@ -134,10 +138,6 @@ export const chatAPI = {
     params.append('scope_type', scopeType);
     if (scopeIds) {
       params.append('scope_ids', scopeIds.join(','));
-    }
-    const token = localStorage.getItem('token');
-    if (token) {
-      params.append('token', token);
     }
     return `${api.defaults.baseURL}/api/chat/query?${params.toString()}`;
   },

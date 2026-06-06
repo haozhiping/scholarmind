@@ -4,18 +4,17 @@ import uuid
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from datetime import datetime
 from fastapi import HTTPException
-from fastapi.responses import EventSourceResponse
 from loguru import logger
 
 from .schemas import Message, Conversation, ChatRequest, CiteInfo, SSEEvent
 from .intent_router import IntentRouter
 from .agent import ReviewAgent
 from ..retrieval.retriever import HybridRetriever
-from ...common.db.pg_client import AsyncPGClient
-from ...common.db.redis_client import AsyncRedisClient
-from ...common.db.mysql_client import mysql
-from ...common.clients.llm import AsyncLLMClient
-from ...common.exceptions import (
+from common.db.pg_client import AsyncPGClient
+from common.db.redis_client import AsyncRedisClient
+from common.db.mysql_client import mysql
+from common.clients.llm import AsyncLLMClient
+from common.exceptions import (
     DatabaseException, 
     LLMException, 
     RedisException, 
@@ -401,29 +400,36 @@ class ChatService:
     async def save_feedback(
         self, message_id: str, is_positive: bool, reason: str = "", user_id: str = ""
     ):
-        """Save user feedback to MySQL query_logs.
+        """Attach user feedback to the latest real query log (MySQL).
 
-        Uses the ``feedback`` TINYINT column: 1 = up / -1 = down.
-        ``question`` is populated as a summary string (NOT NULL constraint).
-        ``user_id`` is cast to int (MySQL BIGINT column).
+        Updates the ``feedback`` TINYINT column (1 = up / -1 = down) on the
+        user's most recent query_logs row. We deliberately do NOT INSERT a new
+        row: the previous implementation created synthetic
+        ``question="Feedback for msg …"`` rows that polluted the query-log view
+        with fake question entries.
         """
         try:
             feedback_val = 1 if is_positive else -1
             user_id_int = int(user_id) if user_id else 0
-            question_summary = f"Feedback for msg {message_id}"
-            if reason:
-                question_summary += f": {reason}"
 
-            await mysql.execute(
+            affected = await mysql.execute_rowcount(
                 """
-                INSERT INTO query_logs (user_id, question, feedback)
-                VALUES (%s, %s, %s)
+                UPDATE query_logs SET feedback=%s
+                WHERE user_id=%s
+                ORDER BY created_at DESC
+                LIMIT 1
                 """,
-                user_id_int, question_summary, feedback_val,
+                feedback_val, user_id_int,
             )
-            logger.info(
-                f"Feedback saved: msg_id={message_id}, positive={is_positive}"
-            )
+            if affected == 0:
+                logger.warning(
+                    f"No query_log to attach feedback: user_id={user_id_int}, "
+                    f"msg_id={message_id}"
+                )
+            else:
+                logger.info(
+                    f"Feedback saved: msg_id={message_id}, positive={is_positive}"
+                )
         except Exception as e:
             logger.error(f"Failed to save feedback: msg_id={message_id}, error={e}")
             raise DatabaseException(f"Failed to save feedback: {e}")

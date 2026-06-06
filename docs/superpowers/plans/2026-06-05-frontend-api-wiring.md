@@ -342,7 +342,7 @@ git commit -m "feat(frontend): 设置页面配置保存对接真实 API
 ## Task 7: 验证文档 + 收尾
 
 **Files:**
-- Create: `check/任务 5-前端页面与 API 联调 - 验证报告.md`
+- Create: `docs/STATUS.md`（更新验证记录）
 
 - [ ] **Step 1: 编写验证报告**
 
@@ -360,9 +360,9 @@ git commit -m "feat(frontend): 设置页面配置保存对接真实 API
 - [ ] **Step 3: 提交**
 
 ```bash
-git add check/任务 5-前端页面与 API 联调 - 验证报告.md README.md
-git commit -m "docs: 新增任务5前端页面与API联调验证报告
-更新 README.md 任务状态；创建详细验证报告。"
+git add docs/STATUS.md README.md
+git commit -m "docs: 更新 STATUS.md 记录前端页面与API联调验证结果
+更新 README.md 任务状态。"
 ```
 
 ---

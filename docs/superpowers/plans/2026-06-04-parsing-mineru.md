@@ -894,7 +894,7 @@ pdf_bytes(缺失抛 ValueError); 末尾 UPDATE papers.status='done' 带 user_id 
 ## Task 7: 验证文档 + 收尾
 
 **Files:**
-- Create: `check/任务1-解析服务对接-验证报告.md`
+- Create: `docs/STATUS.md`（更新解析服务对接验证记录）
 
 - [ ] **Step 1: 运行完整测试套件并截取输出**
 
@@ -903,7 +903,7 @@ Run: `cd backend && python -m pytest tests -v`
 
 - [ ] **Step 2: 编写验证报告**
 
-Create `check/任务1-解析服务对接-验证报告.md` documenting:
+Create `docs/STATUS.md` documenting:
 - 实现摘要（5 个单元各自做了什么，对应 implement-parsing.md 验收项打勾）
 - **容错归一化的字段映射假设表**（type 别名、content/page/bbox/image 取值优先级）—— 供真实联调核对修正
 - 离线单元测试覆盖项 + `python -m pytest tests` 输出结果
@@ -915,8 +915,8 @@ Create `check/任务1-解析服务对接-验证报告.md` documenting:
 - [ ] **Step 3: 提交**
 
 ```bash
-git add check/任务1-解析服务对接-验证报告.md
-git commit -m "docs: 新增任务1解析服务对接验证报告
+git add docs/STATUS.md
+git commit -m "docs: 更新 STATUS.md 记录任务1解析服务对接验证结果
 
 记录5单元实现与验收项对照、容错归一化字段映射假设表、离线单测覆盖与结果、
 Docker环境待验证项清单及SDK模式pdf_bytes契约收紧说明。"
@@ -941,7 +941,7 @@ If worth persisting, append to `MEMORY.md` a line about: MinerU KIE 是云端 SD
 - 配置新增 → Task 1 ✅
 - pdf_bytes 契约收紧 → Task 6 ✅
 - 错误处理矩阵 → 各 Task 的 try/warning + Task6 ValueError ✅
-- check/ 验证文档 → Task 7 ✅
+- docs/STATUS.md 验证文档 → Task 7 ✅
 - 测试策略（离线单测 + Docker 待验证标注） → Task 2-6 单测 + Task 7 文档 ✅
 
 **Placeholder scan:** 无 TBD/TODO；每个改代码步骤均含完整代码。

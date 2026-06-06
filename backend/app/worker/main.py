@@ -38,9 +38,9 @@ async def _run_parse_pipeline(user_id: int, paper_id: int, pdf_key: str, task_id
     except Exception as e:
         logger.error(f"[task:{task_id}] MinIO download failed: {e}")
         await mysql.execute(
-            "UPDATE ingest_tasks SET stage='failed', error_msg=%s, "
+            "UPDATE ingest_tasks SET status='failed', stage='failed', error_msg=%s, "
             "finished_at=%s WHERE task_id=%s",
-            f"MinIO download failed: {e}", datetime.now(), task_id,
+            f"MinIO 下载失败: {e}", datetime.now(), task_id,
         )
         await mysql.execute(
             "UPDATE papers SET status='failed' WHERE id=%s", paper_id,
@@ -64,11 +64,13 @@ async def _run_parse_pipeline(user_id: int, paper_id: int, pdf_key: str, task_id
             pdf_bytes=pdf_bytes,
             db=mysql,
         )
-    except Exception:
+    except Exception as e:
+        # Full traceback → log (for ops); concise message → DB (shown in UI).
+        logger.error(f"[task:{task_id}] Parsing failed:\n{traceback.format_exc()}")
         await mysql.execute(
             "UPDATE ingest_tasks SET status='failed', stage='failed', error_msg=%s, "
             "finished_at=%s WHERE task_id=%s",
-            traceback.format_exc(), datetime.now(), task_id,
+            f"解析失败: {e}", datetime.now(), task_id,
         )
         await mysql.execute(
             "UPDATE papers SET status='failed' WHERE id=%s", paper_id,
@@ -84,11 +86,12 @@ async def _run_parse_pipeline(user_id: int, paper_id: int, pdf_key: str, task_id
     try:
         from services.indexing.indexer import index_paper
         await index_paper(user_id, paper_id, db=mysql)
-    except Exception:
+    except Exception as e:
+        logger.error(f"[task:{task_id}] Indexing failed:\n{traceback.format_exc()}")
         await mysql.execute(
             "UPDATE ingest_tasks SET status='failed', stage='failed', error_msg=%s, "
             "finished_at=%s WHERE task_id=%s",
-            traceback.format_exc(), datetime.now(), task_id,
+            f"索引失败: {e}", datetime.now(), task_id,
         )
         await mysql.execute(
             "UPDATE papers SET status='failed' WHERE id=%s", paper_id,
@@ -109,13 +112,25 @@ async def _run_parse_pipeline(user_id: int, paper_id: int, pdf_key: str, task_id
 
 def handle_ingest_job(user_id: int, paper_id: int, pdf_key: str, task_id: str) -> None:
     """RQ job entry point — synchronous wrapper for async pipeline.
-    
+
     Registered as the job function for the 'ingest' queue.
     This function is called by RQ worker; it runs the async pipeline with asyncio.
     """
     import asyncio
+
+    async def _runner() -> None:
+        # aiomysql's pool binds to the event loop that created it. RQ runs each
+        # job in a fresh asyncio.run() loop, so we MUST dispose the shared pool
+        # at the end of every job — otherwise the next job reuses a pool bound to
+        # the previous (now-closed) loop and crashes with "Event loop is closed".
+        from common.db.mysql_client import mysql
+        try:
+            await _run_parse_pipeline(user_id, paper_id, pdf_key, task_id)
+        finally:
+            await mysql.disconnect()
+
     try:
-        asyncio.run(_run_parse_pipeline(user_id, paper_id, pdf_key, task_id))
+        asyncio.run(_runner())
     except Exception as e:
         logger.error(f"[task:{task_id}] Pipeline failed with unhandled exception: {e}")
         raise
@@ -127,7 +142,23 @@ def handle_ingest_job(user_id: int, paper_id: int, pdf_key: str, task_id: str) -
 
 def start_worker():
     """Start RQ worker listening on 'ingest' queue."""
+    import asyncio
+
     logger.info("Starting ScholarMind RQ Worker...")
+
+    # Apply pending DB migrations before processing jobs
+    from common.db.mysql_client import mysql
+    from common.db.migrations import run_migrations
+
+    async def _migrate():
+        await run_migrations()
+        await mysql.disconnect()   # pool per-loop — dispose so jobs create fresh ones
+
+    try:
+        asyncio.run(_migrate())
+    except Exception as e:
+        logger.error(f"Migration failed: {e}")
+        raise
 
     redis_conn = Redis(
         host=settings.REDIS_HOST,

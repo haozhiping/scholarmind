@@ -20,7 +20,7 @@
 4. **图片落 MinIO**：抠图上传 `figures` bucket，key=`{user_id}/{paper_id}/{block_id}.png`，回填 `image_key`。
 5. **数据归一化入库**：写 `doc_blocks`、`citations`，更新 `papers.status`。
 6. 新增 MinerU 云端配置项到 `config.py`。
-7. 验证文档写入 `check/`。
+7. 验证文档写入 `docs/STATUS.md`。
 
 ### 不做（YAGNI / 越界）
 - 不接 worker（`handle_ingest_job`）、不改 `papers.py` upload 路由。
@@ -116,7 +116,7 @@ MINERU_TIMEOUT: int = 300             # 轮询总超时(秒)，-1 表示直到�
 - [ ] 参考文献经 LLM 提取写入 `citations`（src_paper_id/dst_title/raw_ref）。
 - [ ] 所有 DB 写入/更新带 `user_id` 或 `paper_id` 归属，多租户隔离。
 - [ ] `papers.status` 在成功后置 `done`。
-- [ ] 容错归一化的字段映射假设写入 `check/` 文档，供真实联调核对。
+- [ ] 容错归一化的字段映射假设写入 `docs/STATUS.md` 文档，供真实联调核对。
 
 ## 8. 测试策略
 

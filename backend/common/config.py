@@ -95,7 +95,7 @@ class Settings(BaseSettings):
 
     # MinerU Agent 轻量解析 API (https://mineru.net/api/v1/agent)
     MINERU_AGENT_BASE_URL: str = "https://mineru.net/api/v1/agent"
-    MINERU_API_KEY: str = ""              # Agent API 鉴权 token (Header: Authorization: Bearer xxx)
+    MINERU_API_KEY: str = ""              # 未使用：Agent 轻量 API 免登录、无需 Token；保留字段以兼容标准 API/旧配置
     MINERU_LANGUAGE: str = "ch"           # 文档语言: ch / en
     MINERU_ENABLE_TABLE: bool = True
     MINERU_ENABLE_FORMULA: bool = True

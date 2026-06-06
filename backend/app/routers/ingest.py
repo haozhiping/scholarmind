@@ -1,9 +1,12 @@
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from redis import Redis
+from rq import Queue
 
 from app.schemas.ingest import IngestBatchResponse, IngestTaskResponse, TaskRetryResponse
 from common.auth.deps import get_current_user
+from common.config import settings
 from common.db.mysql_client import mysql
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -106,11 +109,36 @@ async def retry_task(
     if not row:
         raise HTTPException(status_code=404, detail="任务不存在")
 
+    paper = await mysql.fetchone(
+        "SELECT pdf_key FROM papers WHERE id=%s AND user_id=%s",
+        row["paper_id"], current["id"],
+    )
+    if not paper:
+        raise HTTPException(status_code=404, detail="论文不存在")
+
+    # Reset task + paper state (column is error_msg, not error).
     await mysql.execute(
-        "UPDATE ingest_tasks SET status='pending', stage='parsing', progress=0, error=NULL "
+        "UPDATE ingest_tasks SET status='pending', stage='queued', progress=0, "
+        "error_msg=NULL, started_at=NULL, finished_at=NULL "
         "WHERE task_id=%s AND user_id=%s",
         id, current["id"],
     )
+    await mysql.execute(
+        "UPDATE papers SET status='pending' WHERE id=%s AND user_id=%s",
+        row["paper_id"], current["id"],
+    )
+
+    # Re-enqueue the RQ job so the pipeline actually re-runs.
+    redis_conn = Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_DB)
+    rq_queue = Queue("ingest", connection=redis_conn)
+    rq_queue.enqueue(
+        "app.worker.main.handle_ingest_job",
+        user_id=current["id"],
+        paper_id=row["paper_id"],
+        pdf_key=paper["pdf_key"],
+        task_id=id,
+    )
+
     return TaskRetryResponse(
         task_id=id,
         status="pending",

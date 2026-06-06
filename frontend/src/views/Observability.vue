@@ -135,7 +135,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { observabilityAPI } from '../api';
@@ -183,15 +183,42 @@ const activeTasks = ref<Task[]>([]);
 const queryLogs = ref<QueryLog[]>([]);
 const stats = ref<Stats | null>(null);
 
+// Polling management
+let tasksPollId: ReturnType<typeof setInterval> | null = null;
+let statsPollId: ReturnType<typeof setInterval> | null = null;
+
+function startPolling() {
+  stopPolling();
+  // 入库任务进度条：3 秒刷新（高频变化）
+  tasksPollId = setInterval(() => {
+    loadActiveTasks();
+  }, 3000);
+  // 统计卡片：30 秒刷新（低频变化）
+  statsPollId = setInterval(() => {
+    loadStats();
+  }, 30000);
+}
+
+function stopPolling() {
+  if (tasksPollId !== null) {
+    clearInterval(tasksPollId);
+    tasksPollId = null;
+  }
+  if (statsPollId !== null) {
+    clearInterval(statsPollId);
+    statsPollId = null;
+  }
+}
+
 onMounted(async () => {
   await loadStats();
   await loadActiveTasks();
   await loadQueryLogs();
-  
-  // Poll for active tasks every 3 seconds
-  setInterval(async () => {
-    await loadActiveTasks();
-  }, 3000);
+  startPolling();
+});
+
+onUnmounted(() => {
+  stopPolling();
 });
 
 async function loadStats() {

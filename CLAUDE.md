@@ -26,7 +26,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - ❌ **裸用单一 embedding 跨语言**：中文搜英文必须配 Query翻译 + 中文摘要增强，见 `docs/rag-pipeline.md`。
 - ❌ **把大表塞进一个 chunk**：大表走"小-大检索"（摘要入库→`doc_blocks` 取整表）。
-- ❌ **丢弃图片/页码**：每个 chunk 必带 `page_num/bbox/block_id/image_key`（前身项目栽在这）。
+- ❌ **丢弃图片/页码**：每个 chunk 必带 `page_num/bbox/block_id/image_key`。
 - ❌ **用 FastAPI BackgroundTasks 跑批量**：必须走 RQ worker（可重试/可恢复/限并发）。
 - ❌ **Milvus 不建索引或全库扫**：必须 HNSW 索引 + `user_id` 分区 + scalar 作用域过滤。
 - ❌ 换 Celery / Pinecone / LangChain / Elasticsearch：本项目已锁 RQ / Milvus / LlamaIndex。

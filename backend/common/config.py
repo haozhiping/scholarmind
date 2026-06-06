@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     MYSQL_USER: str = "root"
     MYSQL_PASSWORD: str = "change-me"
     MYSQL_DB: str = "scholarmind"
+    MYSQL_POOL_SIZE: int = 5
 
     # PostgreSQL
     PG_HOST: str = "postgres"

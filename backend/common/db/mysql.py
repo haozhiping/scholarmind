@@ -16,7 +16,7 @@ DATABASE_URL = (
 
 engine = create_async_engine(
     DATABASE_URL,
-    pool_size=settings.MYSQL_POOL_SIZE,
+    pool_size=getattr(settings, "MYSQL_POOL_SIZE", 5),
     max_overflow=10,
     pool_recycle=3600,
     echo=False,

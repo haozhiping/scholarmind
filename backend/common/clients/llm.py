@@ -66,6 +66,39 @@ async def chat_complete(
     return resp.choices[0].message.content or ""
 
 
+async def chat_stream(
+    prompt: str,
+    *,
+    system: str = "You are a helpful assistant.",
+    model: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+):
+    """
+    Stream LLM output as token deltas (async generator of str).
+    On failure, yields a single graceful fallback message so the SSE stream still completes.
+    """
+    client = _llm_client()
+    try:
+        stream = await client.chat.completions.create(
+            model=model or settings.LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature if temperature is not None else settings.LLM_TEMPERATURE,
+            max_tokens=max_tokens or settings.LLM_MAX_TOKENS,
+            stream=True,
+        )
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[llm] stream failed: {e}")
+        yield "（当前大模型服务不可用，以下为基于检索资料的占位回答）"
+        yield "\n抱歉，模型接口暂时无法连接，请检查 .env 中的 LLM_API_KEY/LLM_MODEL 配置。"
+
+
 async def chat_complete_json(prompt: str, **kwargs) -> Any:
     """Call LLM and parse the response as JSON. Retries once on parse failure."""
     kwargs["json_mode"] = True
@@ -117,19 +150,53 @@ async def vlm_describe_image(image_url: str, caption: str = "") -> str:
 # Embedding
 # ---------------------------------------------------------------------------
 
+def _fallback_embedding(text: str) -> list[float]:
+    """
+    Deterministic pseudo-embedding used only when the real embedding API is unavailable.
+    Keeps the whole pipeline runnable (Milvus insert/search) without valid model keys.
+    Not semantically meaningful — logged as a warning by the caller.
+    """
+    import hashlib
+    import math
+
+    dim = settings.EMBEDDING_DIM
+    seed = hashlib.sha256((text or " ").encode("utf-8")).digest()
+    # Expand the 32-byte digest into `dim` floats via a simple counter hash.
+    vals: list[float] = []
+    i = 0
+    while len(vals) < dim:
+        h = hashlib.sha256(seed + i.to_bytes(4, "big")).digest()
+        for b in h:
+            vals.append((b / 255.0) * 2.0 - 1.0)
+            if len(vals) >= dim:
+                break
+        i += 1
+    norm = math.sqrt(sum(v * v for v in vals)) or 1.0
+    return [v / norm for v in vals]
+
+
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch embed texts, respecting EMBEDDING_BATCH size."""
+    """
+    Batch embed texts, respecting EMBEDDING_BATCH size.
+    On API failure, falls back to deterministic vectors so the pipeline never hard-fails.
+    """
+    if not texts:
+        return []
     client = _embedding_client()
     results: list[list[float]] = []
     batch = settings.EMBEDDING_BATCH
 
     for i in range(0, len(texts), batch):
         chunk = texts[i : i + batch]
-        resp = await client.embeddings.create(
-            model=settings.EMBEDDING_MODEL,
-            input=chunk,
-        )
-        results.extend([item.embedding for item in resp.data])
+        try:
+            resp = await client.embeddings.create(
+                model=settings.EMBEDDING_MODEL,
+                input=chunk,
+            )
+            results.extend([item.embedding for item in resp.data])
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[embed] API failed ({e}); using deterministic fallback for {len(chunk)} texts")
+            results.extend(_fallback_embedding(t) for t in chunk)
     return results
 
 

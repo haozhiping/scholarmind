@@ -35,19 +35,19 @@
         <div class="metrics-grid">
           <div class="metric-card">
             <span class="metric-title">📁 知识库文档数</span>
-            <div class="metric-val">12 <span class="sub">篇</span></div>
+            <div class="metric-val">{{ stats.paper_count }} <span class="sub">篇</span></div>
           </div>
           <div class="metric-card">
             <span class="metric-title">🧩 已构建向量分块</span>
-            <div class="metric-val">3,248 <span class="sub">个</span></div>
+            <div class="metric-val">{{ stats.chunk_count }} <span class="sub">个</span></div>
           </div>
           <div class="metric-card">
             <span class="metric-title">⚡ 平均问答延迟</span>
-            <div class="metric-val">420 <span class="sub">ms</span></div>
+            <div class="metric-val">{{ stats.average_latency_ms }} <span class="sub">ms</span></div>
           </div>
           <div class="metric-card">
-            <span class="metric-title">💾 Redis 缓存命中率</span>
-            <div class="metric-val">78.5 <span class="sub">%</span></div>
+            <span class="metric-title">💬 累计查询次数</span>
+            <div class="metric-val">{{ stats.total_queries }} <span class="sub">次</span></div>
           </div>
         </div>
 
@@ -117,9 +117,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import api from '../api';
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -132,52 +133,54 @@ const stageMap: Record<string, string> = {
   failed: '任务失败',
 };
 
-const activeTasks = ref([
-  {
-    id: 1,
-    file_name: 'Retrieval-Augmented Generation for NLP Tasks.pdf',
-    stage: 'parsing',
-    progress: 45,
-    started_at: '2026-06-03 21:20:00',
-    error_msg: null,
-  },
-  {
-    id: 2,
-    file_name: 'BGE M3 Embedding Model Paper.pdf',
-    stage: 'queued',
-    progress: 0,
-    started_at: '2026-06-03 21:28:10',
-    error_msg: null,
-  },
-]);
+const stats = ref({ paper_count: 0, chunk_count: 0, average_latency_ms: 0, total_queries: 0 });
+const activeTasks = ref<any[]>([]);
+const queryLogs = ref<any[]>([]);
+let timer: number | undefined;
 
-const queryLogs = ref([
-  {
-    id: 101,
-    question: 'Transformer的多头注意力是什么作用？',
-    rewritten_query: 'Transformer multi-head attention mechanism function and purpose',
-    latency_ms: 380,
-    prompt_tokens: 1540,
-    completion_tokens: 320,
-    retrieved_chunk_ids: [12, 15, 23],
-    feedback: 1,
-  },
-  {
-    id: 102,
-    question: '混合检索在 Milvus 里面怎么弄？',
-    rewritten_query: 'How to implement hybrid dense and sparse search in Milvus vector database',
-    latency_ms: 450,
-    prompt_tokens: 1820,
-    completion_tokens: 280,
-    retrieved_chunk_ids: [48, 51],
-    feedback: undefined,
-  },
-]);
+async function loadStats() {
+  try {
+    const res = await api.get('/stats/overview');
+    stats.value = res.data;
+  } catch (e) { console.error('加载统计失败', e); }
+}
+
+async function loadTasks() {
+  try {
+    const res = await api.get('/ingest/tasks');
+    activeTasks.value = res.data.map((t: any) => ({
+      id: t.id,
+      file_name: `论文 #${t.paper_id}`,
+      stage: t.stage,
+      progress: Math.round(t.progress),
+      started_at: typeof t.updated_at === 'string' ? t.updated_at.replace('T', ' ').substring(0, 19) : t.updated_at,
+      error_msg: t.error,
+    }));
+  } catch (e) { console.error('加载任务失败', e); }
+}
+
+async function loadQueryLogs() {
+  try {
+    const res = await api.get('/logs/queries', { params: { limit: 20 } });
+    queryLogs.value = res.data;
+  } catch (e) { console.error('加载查询日志失败', e); }
+}
+
+async function refreshAll() {
+  await Promise.all([loadStats(), loadTasks(), loadQueryLogs()]);
+}
 
 function handleLogout() {
   authStore.clearAuth();
   router.push('/login');
 }
+
+onMounted(async () => {
+  await refreshAll();
+  timer = window.setInterval(refreshAll, 5000);
+});
+
+onUnmounted(() => { if (timer) clearInterval(timer); });
 </script>
 
 <style scoped>

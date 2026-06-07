@@ -6,9 +6,14 @@ class QueryLogResponse(BaseModel):
     id: int
     user_id: int
     question: str
-    answer_snippet: str
-    latency_ms: int
-    tokens_used: int
+    answer_snippet: str = ""
+    latency_ms: int = 0
+    tokens_used: int = 0
+    rewritten_query: Optional[str] = None
+    retrieved_chunk_ids: Optional[List] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    feedback: Optional[int] = None
     created_at: datetime
 
 class AccessLogResponse(BaseModel):

@@ -174,9 +174,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick } from 'vue';
+import { ref, computed, nextTick, onMounted, watch, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import api from '../api';
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -190,10 +191,13 @@ interface Paper {
   created_at: string;
 }
 
+interface Folder { id: number; name: string; }
+
 const isDragging = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 const searchQuery = ref('');
 const selectedFolderId = ref<number | null>(null);
+const uploading = ref(false);
 
 const showCreateFolderModal = ref(false);
 const newFolderName = ref('');
@@ -203,8 +207,10 @@ const confirmModal = ref({
   show: false,
   title: '',
   message: '',
-  onConfirm: null as (() => void) | null
+  onConfirm: null as (() => void) | null,
 });
+
+let pollTimer: number | undefined;
 
 function triggerFileSelect() {
   fileInput.value?.click();
@@ -215,41 +221,53 @@ const statusMap: Record<string, string> = {
   parsing: '解析中',
   indexing: '索引中',
   done: '就绪',
+  completed: '就绪',
   failed: '失败',
 };
 
-const folders = ref([
-  { id: 1, name: '大语言模型 (LLM)' },
-  { id: 2, name: '多模态与 VLM' },
-  { id: 3, name: 'RAG 检索增强生成' },
-]);
+const folders = ref<Folder[]>([]);
+const papers = ref<Paper[]>([]);
 
-const papers = ref<Paper[]>([
-  {
-    id: 1,
-    title: 'Attention Is All You Need',
-    authors: ['Vaswani et al.'],
-    year: 2017,
-    status: 'done',
-    created_at: '2026-06-03 10:00:00',
-  },
-  {
-    id: 2,
-    title: 'Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks',
-    authors: ['Lewis et al.'],
-    year: 2020,
-    status: 'parsing',
-    created_at: '2026-06-03 12:30:00',
-  },
-]);
+function mapPaper(p: any): Paper {
+  return {
+    id: p.id,
+    title: p.title,
+    authors: p.authors ? String(p.authors).split(/,\s*/) : [],
+    year: p.year ?? undefined,
+    status: p.status,
+    created_at: typeof p.created_at === 'string' ? p.created_at.replace('T', ' ').substring(0, 19) : p.created_at,
+  };
+}
+
+async function loadFolders() {
+  try {
+    const res = await api.get('/folders');
+    folders.value = res.data.map((f: any) => ({ id: f.id, name: f.name }));
+  } catch (e) {
+    console.error('加载文件夹失败', e);
+  }
+}
+
+async function loadPapers() {
+  try {
+    const params: any = {};
+    if (selectedFolderId.value !== null) params.folder_id = selectedFolderId.value;
+    const res = await api.get('/papers', { params });
+    papers.value = res.data.map(mapPaper);
+  } catch (e) {
+    console.error('加载论文失败', e);
+  }
+}
 
 const filteredPapers = computed(() => {
-  return papers.value.filter(paper => {
-    const matchesSearch = paper.title.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
-      paper.authors.some(auth => auth.toLowerCase().includes(searchQuery.value.toLowerCase()));
-    return matchesSearch;
-  });
+  const q = searchQuery.value.toLowerCase();
+  return papers.value.filter((paper) =>
+    paper.title.toLowerCase().includes(q) ||
+    paper.authors.some((a) => a.toLowerCase().includes(q)),
+  );
 });
+
+watch(selectedFolderId, loadPapers);
 
 function handleLogout() {
   authStore.clearAuth();
@@ -263,69 +281,103 @@ async function createFolder() {
   newFolderInputRef.value?.focus();
 }
 
-function submitCreateFolder() {
+async function submitCreateFolder() {
   const name = newFolderName.value.trim();
-  if (name) {
-    folders.value.push({
-      id: Date.now(),
-      name: name,
-    });
+  if (!name) return;
+  try {
+    await api.post('/folders', { name });
     showCreateFolderModal.value = false;
+    await loadFolders();
+  } catch (e) {
+    console.error('创建文件夹失败', e);
   }
 }
 
-function confirmDeleteFolder(folder: { id: number; name: string }) {
+function confirmDeleteFolder(folder: Folder) {
   confirmModal.value = {
     show: true,
-    title: "🗑️ 删除文献文件夹",
-    message: `确定要删除文件夹 "${folder.name}" 吗？删除该文件夹不会删除其中的文献，文献将被归类到未分类中。`,
-    onConfirm: () => {
-      folders.value = folders.value.filter(f => f.id !== folder.id);
-      if (selectedFolderId.value === folder.id) {
-        selectedFolderId.value = null;
+    title: '🗑️ 删除文献文件夹',
+    message: `确定要删除文件夹 "${folder.name}" 吗？其中的文献将被归类到未分类。`,
+    onConfirm: async () => {
+      try {
+        await api.delete(`/folders/${folder.id}`);
+        if (selectedFolderId.value === folder.id) selectedFolderId.value = null;
+        await loadFolders();
+        await loadPapers();
+      } catch (e) {
+        console.error('删除文件夹失败', e);
       }
-    }
+    },
   };
 }
 
 function handleDrop(e: DragEvent) {
   isDragging.value = false;
   const files = e.dataTransfer?.files;
-  if (files) {
-    uploadFiles(files);
-  }
+  if (files) uploadFiles(files);
 }
 
 function handleFileSelect(e: Event) {
   const target = e.target as HTMLInputElement;
-  if (target.files) {
-    uploadFiles(target.files);
-  }
+  if (target.files) uploadFiles(target.files);
 }
 
-function uploadFiles(files: FileList) {
+async function uploadFiles(files: FileList) {
+  const fd = new FormData();
+  let count = 0;
   for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    papers.value.push({
-      id: Date.now() + i,
-      title: file.name.replace('.pdf', ''),
-      authors: ['待解析'],
-      year: undefined,
-      status: 'pending',
-      created_at: new Date().toISOString().replace('T', ' ').substring(0, 19),
-    });
+    if (files[i].name.toLowerCase().endsWith('.pdf')) {
+      fd.append('files', files[i]);
+      count++;
+    }
+  }
+  if (count === 0) return;
+  if (selectedFolderId.value !== null) fd.append('folder_id', String(selectedFolderId.value));
+
+  uploading.value = true;
+  try {
+    await api.post('/papers/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+    await loadPapers();
+    startPolling();
+  } catch (e) {
+    console.error('上传失败', e);
+  } finally {
+    uploading.value = false;
+    if (fileInput.value) fileInput.value.value = '';
   }
 }
 
-// Use custom modal for delete confirmation
+function startPolling() {
+  stopPolling();
+  let ticks = 0;
+  pollTimer = window.setInterval(async () => {
+    ticks++;
+    await loadPapers();
+    const pending = papers.value.some((p) => p.status === 'pending');
+    if (!pending || ticks > 60) stopPolling();
+  }, 3000);
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = undefined;
+  }
+}
+
 function deletePaper(id: number) {
   confirmModal.value = {
     show: true,
-    title: "🗑️ 删除文献",
-    message: "确认删除此文献吗？其对应的向量与解析内容均将被彻底清理，不可恢复。",
-    onConfirm: () => {
-      papers.value = papers.value.filter(p => p.id !== id);
-    }
+    title: '🗑️ 删除文献',
+    message: '确认删除此文献吗？其向量与解析内容将被彻底清理，不可恢复。',
+    onConfirm: async () => {
+      try {
+        await api.delete(`/papers/${id}`);
+        await loadPapers();
+      } catch (e) {
+        console.error('删除论文失败', e);
+      }
+    },
   };
 }
 
@@ -339,6 +391,13 @@ function closeConfirmModal(isConfirmed: boolean) {
 function openPaper(paper: any) {
   router.push({ path: '/chat', query: { paperId: paper.id } });
 }
+
+onMounted(async () => {
+  await loadFolders();
+  await loadPapers();
+});
+
+onUnmounted(stopPolling);
 </script>
 
 <style scoped>

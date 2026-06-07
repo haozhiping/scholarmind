@@ -172,6 +172,44 @@ def _mineru_to_blocks(raw_blocks: list[dict]) -> list[Block]:
 
 
 # ---------------------------------------------------------------------------
+# Fallback: extract text blocks directly from the PDF (when MinerU is unavailable)
+# ---------------------------------------------------------------------------
+
+def _fallback_extract_sync(pdf_path: str) -> list[Block]:
+    """Extract paragraph-ish text blocks per page using pypdf. No figures/tables."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(pdf_path)
+    blocks: list[Block] = []
+    for page_idx, page in enumerate(reader.pages, start=1):
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        # Split into paragraphs on blank lines; keep non-trivial chunks.
+        for para in re.split(r"\n\s*\n", page_text):
+            para = para.strip()
+            if len(para) >= 40:
+                blocks.append(Block(block_type="text", content=para, page_num=page_idx))
+    return blocks
+
+
+async def _fallback_extract(pdf_key: str) -> list[Block]:
+    from common.clients.minio import download_to_tempfile
+
+    tmp_path = await asyncio.to_thread(
+        download_to_tempfile, settings.MINIO_BUCKET_PDF, pdf_key, ".pdf"
+    )
+    try:
+        return await asyncio.to_thread(_fallback_extract_sync, tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Step 2: Upload figure images to MinIO, backfill block.image_key
 # ---------------------------------------------------------------------------
 
@@ -335,13 +373,22 @@ async def parse_paper(
     logger.info(f"[parse] paper_id={paper_id} user_id={user_id} provider={settings.REFERENCE_PARSER_PROVIDER}")
 
     try:
-        # --- Step 1: MinerU KIE SDK ---
-        raw_blocks = await _call_mineru(pdf_key)
-        blocks = _mineru_to_blocks(raw_blocks)
-        logger.info(f"[parse] MinerU returned {len(blocks)} blocks")
+        # --- Step 1: MinerU KIE SDK (with PDF text-extraction fallback) ---
+        raw_blocks = []
+        try:
+            raw_blocks = await _call_mineru(pdf_key)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[parse] MinerU failed ({e}); will use PDF text fallback")
 
-        # --- Step 2: Upload figures to MinIO ---
-        await _upload_figures_to_minio(blocks, raw_blocks)
+        blocks = _mineru_to_blocks(raw_blocks)
+        if not blocks:
+            blocks = await _fallback_extract(pdf_key)
+            raw_blocks = [{} for _ in blocks]  # no figure image_data in fallback mode
+            logger.info(f"[parse] fallback extraction produced {len(blocks)} text blocks")
+        else:
+            logger.info(f"[parse] MinerU returned {len(blocks)} blocks")
+            # --- Step 2: Upload figures to MinIO (MinerU mode only) ---
+            await _upload_figures_to_minio(blocks, raw_blocks)
 
         # --- Step 3: VLM figure descriptions + reference extraction (concurrent) ---
         vlm_task = asyncio.create_task(_describe_figures(blocks))

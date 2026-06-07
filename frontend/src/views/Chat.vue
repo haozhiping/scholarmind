@@ -125,10 +125,14 @@
 
               <!-- Figure Block -->
               <div v-else-if="activeCitation.chunk_type === 'figure'" class="image-viewer">
-                <div class="mock-image">
-                  🖼️ [图表 Key: {{ activeCitation.image_key }}]
-                  <p class="img-caption">{{ activeCitation.content }}</p>
-                </div>
+                <img
+                  v-if="activeCitation.image_key"
+                  :src="figureUrl(activeCitation.image_key)"
+                  class="figure-img"
+                  alt="figure"
+                />
+                <div v-else class="mock-image">🖼️ 暂无图片</div>
+                <p class="img-caption">{{ activeCitation.content }}</p>
               </div>
 
               <!-- Formula Block -->
@@ -151,33 +155,37 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick } from 'vue';
-import { useRouter } from 'vue-router';
+import { ref, nextTick, onMounted } from 'vue';
+import { useRouter, useRoute } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import { API_BASE, figureUrl } from '../api';
 
 interface Citation {
+  paper_id?: number;
   paper_title: string;
   page_num: number;
   bbox: string;
   chunk_type: string;
   content: string;
-  image_key?: string;
+  image_key?: string | null;
 }
 
 interface Message {
   id: number;
   role: string;
-  content: string;
+  content: string;       // rendered HTML
   citations: Citation[];
 }
 
 const router = useRouter();
+const route = useRoute();
 const authStore = useAuthStore();
 
 const inputQuery = ref('');
 const streaming = ref(false);
 const streamingText = ref('');
 const messageListRef = ref<HTMLDivElement | null>(null);
+const conversationId = ref<number>(0);
 
 const activeCitation = ref<any>(null);
 
@@ -192,7 +200,7 @@ const messages = ref<Message[]>([
   {
     id: 1,
     role: 'assistant',
-    content: '您好！我是您的跨语言文献调研助手“文渊”。请问有什么关于论文、公式或图表的问题我可以帮您解答？',
+    content: '您好！我是您的跨语言文献调研助手“文渊”。请基于已入库的论文向我提问，我会带引用溯源作答。',
     citations: [],
   },
 ]);
@@ -206,68 +214,111 @@ function showCitationDetail(cite: any) {
   activeCitation.value = cite;
 }
 
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Minimal markdown -> HTML: escape, bold **x**, headings ###, [n] badges, newlines.
+function renderContent(text: string): string {
+  let html = escapeHtml(text);
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/^###\s*(.+)$/gm, '<h4>$1</h4>');
+  html = html.replace(/\[(\d+)\]/g, '<sup class="cite-ref">[$1]</sup>');
+  html = html.replace(/\n/g, '<br/>');
+  return html;
+}
+
+function getScope() {
+  const paperId = route.query.paperId;
+  if (paperId) {
+    return { scope_type: 'papers', paper_ids: [Number(paperId)], folder_id: null };
+  }
+  return { scope_type: 'all', paper_ids: null, folder_id: null };
+}
+
 async function sendMessage() {
   if (!inputQuery.value.trim() || streaming.value) return;
 
   const userText = inputQuery.value;
   inputQuery.value = '';
 
-  // 1. Add User Message
-  messages.value.push({
-    id: Date.now(),
-    role: 'user',
-    content: userText,
-    citations: [],
-  });
-
+  messages.value.push({ id: Date.now(), role: 'user', content: escapeHtml(userText), citations: [] });
   await scrollToBottom();
 
-  // 2. Mock SSE Response Streaming
   streaming.value = true;
   streamingText.value = '';
+  const collectedCitations: Citation[] = [];
+  const scope = getScope();
 
-  const mockResponse = `根据先前有关 RAG 的研究 <strong>Attention Is All You Need</strong> [1] 中提出的 Transformer 架构，多头注意力机制大大增强了序列特征的建模能力。对于多文档及复杂对比任务，通常结合混合检索 [2] 能够召回更精准的信息。`;
-  
-  const mockCitations = [
-    {
-      paper_title: 'Attention Is All You Need',
-      page_num: 3,
-      bbox: '[3, 100, 200, 500, 300]',
-      chunk_type: 'text',
-      content: 'We propose the Transformer, a model architecture eschewing recurrence and instead relying entirely on an attention mechanism to draw global dependencies between input and output.',
-    },
-    {
-      paper_title: 'Retrieval-Augmented Generation for NLP Tasks',
-      page_num: 5,
-      bbox: '[5, 50, 80, 480, 220]',
-      chunk_type: 'table',
-      image_key: 'fig_dataset_comparison',
-      content: '<table border="1" class="mock-table"><tr><th>Model</th><th>Accuracy</th></tr><tr><td>Dense Retrieve</td><td>44.2%</td></tr><tr><td>Hybrid (RRF)</td><td>51.8%</td></tr></table>',
-    },
-  ];
+  try {
+    const resp = await fetch(`${API_BASE}/chat/query`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authStore.token}`,
+      },
+      body: JSON.stringify({
+        question: userText,
+        conversation_id: conversationId.value,
+        scope_type: scope.scope_type,
+        folder_id: scope.folder_id,
+        paper_ids: scope.paper_ids,
+      }),
+    });
 
-  let currentIdx = 0;
-  const interval = setInterval(async () => {
-    if (currentIdx < mockResponse.length) {
-      // Stream characters or tokens
-      streamingText.value += mockResponse.charAt(currentIdx);
-      currentIdx++;
-      await scrollToBottom();
-    } else {
-      clearInterval(interval);
-      streaming.value = false;
-      
-      // Save final message
-      messages.value.push({
-        id: Date.now() + 1,
-        role: 'assistant',
-        content: streamingText.value,
-        citations: mockCitations,
-      });
-      streamingText.value = '';
-      await scrollToBottom();
+    if (!resp.ok || !resp.body) {
+      throw new Error(`HTTP ${resp.status}`);
     }
-  }, 15);
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';
+
+      for (const block of events) {
+        const lines = block.split('\n');
+        let eventType = 'message';
+        let dataStr = '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) eventType = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+        }
+        if (!dataStr) continue;
+        let data: any;
+        try { data = JSON.parse(dataStr); } catch { continue; }
+
+        if (eventType === 'meta' && data.conversation_id) {
+          conversationId.value = data.conversation_id;
+        } else if (eventType === 'cite') {
+          collectedCitations.push(data);
+        } else if (eventType === 'token') {
+          streamingText.value += data.delta || '';
+          await scrollToBottom();
+        } else if (eventType === 'error') {
+          streamingText.value += `\n[错误] ${data.msg || '生成失败'}`;
+        }
+      }
+    }
+  } catch (e: any) {
+    streamingText.value += `\n[请求失败] ${e.message || e}`;
+  }
+
+  streaming.value = false;
+  messages.value.push({
+    id: Date.now() + 1,
+    role: 'assistant',
+    content: renderContent(streamingText.value || '（无回答）'),
+    citations: collectedCitations,
+  });
+  streamingText.value = '';
+  await scrollToBottom();
 }
 
 async function scrollToBottom() {
@@ -276,6 +327,11 @@ async function scrollToBottom() {
     messageListRef.value.scrollTop = messageListRef.value.scrollHeight;
   }
 }
+
+onMounted(() => {
+  // figureUrl imported for template use
+  void figureUrl;
+});
 </script>
 
 <style scoped>
@@ -685,6 +741,24 @@ async function scrollToBottom() {
   color: #667e6e;
   font-weight: normal;
   margin-top: 15px;
+}
+
+.figure-img {
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid #e1e6e3;
+}
+
+.message-content :deep(.cite-ref) {
+  color: #1c7243;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.message-content :deep(h4) {
+  margin: 12px 0 6px;
+  font-size: 15px;
+  color: #0f3d24;
 }
 
 .clear-cite-btn {

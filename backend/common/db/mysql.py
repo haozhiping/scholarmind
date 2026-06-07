@@ -35,3 +35,14 @@ async def get_db_session():
         except Exception:
             await session.rollback()
             raise
+
+
+async def get_db():
+    """FastAPI dependency: yields a session, commits on success, rolls back on error."""
+    async with _AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise

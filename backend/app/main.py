@@ -1,6 +1,9 @@
-from fastapi import FastAPI
+import time
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from sqlalchemy import text
 from common.config import settings
 from common.logging import logger
 
@@ -26,6 +29,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def access_log_middleware(request: Request, call_next):
+    """Best-effort access logging into MySQL access_logs (never blocks the response on error)."""
+    start = time.monotonic()
+    response = await call_next(request)
+    try:
+        path = request.url.path
+        if path.startswith("/api") and request.method != "OPTIONS":
+            from common.db.mysql import get_db_session
+            latency = int((time.monotonic() - start) * 1000)
+            client_ip = request.client.host if request.client else None
+            async with get_db_session() as db:
+                await db.execute(
+                    text("""
+                        INSERT INTO access_logs (user_id, method, path, status_code, ip, latency_ms)
+                        VALUES (NULL, :m, :p, :s, :ip, :lat)
+                    """),
+                    {"m": request.method, "p": path[:255], "s": response.status_code, "ip": client_ip, "lat": latency},
+                )
+    except Exception:  # noqa: BLE001
+        pass
+    return response
+
 # Register routers under /api prefix
 app.include_router(auth_router, prefix="/api")
 app.include_router(papers_router, prefix="/api")
@@ -34,6 +61,33 @@ app.include_router(ingest_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(advanced_router, prefix="/api")
 app.include_router(observability_router, prefix="/api")
+
+@app.on_event("startup")
+async def ensure_schema():
+    """
+    Idempotent self-healing migration for DB volumes initialized before later schema additions
+    (e.g. doc_blocks.content_zh). Safe to run on every startup.
+    """
+    migrations = [
+        ("doc_blocks", "content_zh", "ALTER TABLE doc_blocks ADD COLUMN content_zh TEXT NULL AFTER content"),
+    ]
+    try:
+        from common.db.mysql import get_db_session
+        async with get_db_session() as db:
+            for table, column, ddl in migrations:
+                exists = await db.execute(
+                    text("""
+                        SELECT COUNT(*) FROM information_schema.columns
+                        WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c
+                    """),
+                    {"t": table, "c": column},
+                )
+                if (exists.scalar() or 0) == 0:
+                    await db.execute(text(ddl))
+                    logger.info(f"[migrate] added {table}.{column}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[migrate] schema check failed: {e}")
+
 
 @app.get("/health")
 async def health_check():

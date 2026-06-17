@@ -1,7 +1,8 @@
 import axios from 'axios';
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || 'http://localhost:8000',
+  // Dev: Vite proxy forwards /api → localhost:8008; Prod: set VITE_API_BASE
+  baseURL: import.meta.env.VITE_API_BASE || '',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
@@ -14,6 +15,11 @@ api.interceptors.request.use(
     const token = localStorage.getItem('token');
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`;
+    }
+    // For FormData (file upload), let browser auto-set Content-Type with boundary.
+    // The global default 'application/json' would otherwise block multipart uploads.
+    if (config.data instanceof FormData) {
+      delete (config.headers as Record<string, unknown>)['Content-Type'];
     }
     return config;
   },
@@ -34,5 +40,141 @@ api.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+
+// ==================== Auth APIs ====================
+export const authAPI = {
+  login: (username: string, password: string) => 
+    api.post('/api/auth/login', { username, password }),
+  
+  register: (username: string, email: string, password: string) => 
+    api.post('/api/auth/register', { username, email, password }),
+  
+  getMe: () => 
+    api.get('/api/auth/me'),
+};
+
+// ==================== Papers APIs ====================
+export const papersAPI = {
+  // Upload papers (returns batch_id and task_ids)
+  uploadPapers: (files: FileList, folderId?: number) => {
+    const formData = new FormData();
+    for (let i = 0; i < files.length; i++) {
+      formData.append('files', files[i]);
+    }
+    if (folderId) {
+      formData.append('folder_id', folderId.toString());
+    }
+    return api.post('/api/papers/upload', formData, {
+      timeout: 300000, // 5 min timeout for large PDF uploads
+    });
+  },
+  
+  // Get papers list
+  listPapers: (folderId?: number, status?: string) => {
+    const params: Record<string, any> = {};
+    if (folderId !== undefined) params.folder_id = folderId;
+    if (status) params.status = status;
+    return api.get('/api/papers', { params });
+  },
+  
+  // Get paper detail
+  getPaper: (id: number) => 
+    api.get(`/api/papers/${id}`),
+  
+  // Delete paper
+  deletePaper: (id: number) => 
+    api.delete(`/api/papers/${id}`),
+};
+
+// ==================== Folders APIs ====================
+export const foldersAPI = {
+  listFolders: () => 
+    api.get('/api/folders'),
+  
+  createFolder: (name: string, parentId?: number) => 
+    api.post('/api/folders', { name, parent_id: parentId }),
+  
+  deleteFolder: (id: number) => 
+    api.delete(`/api/folders/${id}`),
+};
+
+// ==================== Ingest APIs ====================
+export const ingestAPI = {
+  // Get batch progress
+  getBatchProgress: (batchId: string) => 
+    api.get(`/api/ingest/batches/${batchId}`),
+  
+  // Get tasks list
+  listTasks: (batchId?: string) => {
+    const params: Record<string, any> = {};
+    if (batchId) params.batch_id = batchId;
+    return api.get('/api/ingest/tasks', { params });
+  },
+  
+  // Retry failed task
+  retryTask: (id: string) => 
+    api.post(`/api/ingest/tasks/${id}/retry`),
+};
+
+// ==================== Chat APIs ====================
+export const chatAPI = {
+  // Create conversation
+  createConversation: (title?: string, folderId?: number, paperIds?: number[]) => 
+    api.post('/api/chat/conversations', { title, folder_id: folderId, paper_ids: paperIds }),
+  
+  // Get conversations list
+  listConversations: () => 
+    api.get('/api/chat/conversations'),
+  
+  // Get conversation messages
+  getMessages: (conversationId: string) => 
+    api.get(`/api/chat/conversations/${conversationId}/messages`),
+  
+  // SSE chat query URL（token 走 Authorization Header，不走 URL query）
+  getQuerySSEUrl: (conversationId: string, question: string, scopeType: string = 'all', scopeIds?: number[]) => {
+    const params = new URLSearchParams();
+    params.append('conversation_id', conversationId.toString());
+    params.append('question', question);
+    params.append('scope_type', scopeType);
+    if (scopeIds) {
+      params.append('scope_ids', scopeIds.join(','));
+    }
+    return `${api.defaults.baseURL}/api/chat/query?${params.toString()}`;
+  },
+  
+  // Send feedback
+  sendFeedback: (messageId: string, isPositive: boolean, reason?: string) => 
+    api.post('/api/chat/feedback', { message_id: messageId, is_positive: isPositive, reason }),
+};
+
+// ==================== Observability APIs ====================
+export const observabilityAPI = {
+  // Get query logs
+  getQueryLogs: (limit: number = 10, offset: number = 0) => 
+    api.get('/api/logs/queries', { params: { limit, offset } }),
+  
+  // Get access logs
+  getAccessLogs: (limit: number = 10, offset: number = 0) => 
+    api.get('/api/logs/access', { params: { limit, offset } }),
+  
+  // Get stats overview
+  getStatsOverview: () => 
+    api.get('/api/stats/overview'),
+  
+  // Get active tasks (for ingestion progress)
+  getActiveTasks: () => 
+    api.get('/api/ingest/tasks'),
+};
+
+// ==================== Settings APIs ====================
+export const settingsAPI = {
+  // Get saved settings
+  getSettings: () =>
+    api.get('/api/settings'),
+
+  // Save global settings
+  saveSettings: (config: Record<string, any>) => 
+    api.post('/api/settings', config),
+};
 
 export default api;

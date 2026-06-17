@@ -36,7 +36,7 @@
         </header>
 
         <!-- Message List -->
-        <div class="message-list" ref="messageListRef">
+        <div class="message-list" ref="messageListRef" @click="onMessageClick">
           <div 
             v-for="msg in messages" 
             :key="msg.id" 
@@ -151,11 +151,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick } from 'vue';
-import { useRouter } from 'vue-router';
+import { ref, nextTick, onMounted, onUnmounted } from 'vue';
+import { useRouter, useRoute } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import { chatAPI } from '../api';
 
 interface Citation {
+  paper_id: number;
   paper_title: string;
   page_num: number;
   bbox: string;
@@ -165,21 +167,25 @@ interface Citation {
 }
 
 interface Message {
-  id: number;
+  id: string;
   role: string;
   content: string;
   citations: Citation[];
 }
 
 const router = useRouter();
+const route = useRoute();
 const authStore = useAuthStore();
 
 const inputQuery = ref('');
 const streaming = ref(false);
 const streamingText = ref('');
 const messageListRef = ref<HTMLDivElement | null>(null);
+let abortController: AbortController | null = null;
 
-const activeCitation = ref<any>(null);
+const activeCitation = ref<Citation | null>(null);
+const currentConversationId = ref<string | null>(null);
+const citationsBuffer = ref<Citation[]>([]);
 
 const blockTypeMap: Record<string, string> = {
   text: '段落文本',
@@ -190,31 +196,67 @@ const blockTypeMap: Record<string, string> = {
 
 const messages = ref<Message[]>([
   {
-    id: 1,
+    id: '00000000-0000-0000-0000-000000000000',
     role: 'assistant',
-    content: '您好！我是您的跨语言文献调研助手“文渊”。请问有什么关于论文、公式或图表的问题我可以帮您解答？',
+    content: '您好！我是您的跨语言文献调研助手"文渊"。请问有什么关于论文、公式或图表的问题我可以帮您解答？',
     citations: [],
   },
 ]);
+
+onMounted(async () => {
+  // Check if coming from paper selection
+  if (route.query.paperId) {
+    // Could auto-create conversation with this paper
+    console.log('Paper selected:', route.query.paperId);
+  }
+  
+  // Try to create or load conversation
+  await initConversation();
+});
+
+onUnmounted(() => {
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
+});
+
+async function initConversation() {
+  try {
+    // Create a new conversation
+    const res = await chatAPI.createConversation('新会话');
+    currentConversationId.value = res.data.id;
+  } catch (error: any) {
+    console.error('Failed to create conversation:', error);
+  }
+}
 
 function handleLogout() {
   authStore.clearAuth();
   router.push('/login');
 }
 
-function showCitationDetail(cite: any) {
+function showCitationDetail(cite: Citation) {
   activeCitation.value = cite;
 }
 
 async function sendMessage() {
   if (!inputQuery.value.trim() || streaming.value) return;
+  
+  if (!currentConversationId.value) {
+    alert('请先创建会话');
+    return;
+  }
 
   const userText = inputQuery.value;
   inputQuery.value = '';
+  
+  // Reset citations buffer
+  citationsBuffer.value = [];
 
   // 1. Add User Message
   messages.value.push({
-    id: Date.now(),
+    id: Date.now().toString(),
     role: 'user',
     content: userText,
     citations: [],
@@ -222,52 +264,141 @@ async function sendMessage() {
 
   await scrollToBottom();
 
-  // 2. Mock SSE Response Streaming
+  // 2. Connect to SSE stream
   streaming.value = true;
   streamingText.value = '';
-
-  const mockResponse = `根据先前有关 RAG 的研究 <strong>Attention Is All You Need</strong> [1] 中提出的 Transformer 架构，多头注意力机制大大增强了序列特征的建模能力。对于多文档及复杂对比任务，通常结合混合检索 [2] 能够召回更精准的信息。`;
   
-  const mockCitations = [
-    {
-      paper_title: 'Attention Is All You Need',
-      page_num: 3,
-      bbox: '[3, 100, 200, 500, 300]',
-      chunk_type: 'text',
-      content: 'We propose the Transformer, a model architecture eschewing recurrence and instead relying entirely on an attention mechanism to draw global dependencies between input and output.',
-    },
-    {
-      paper_title: 'Retrieval-Augmented Generation for NLP Tasks',
-      page_num: 5,
-      bbox: '[5, 50, 80, 480, 220]',
-      chunk_type: 'table',
-      image_key: 'fig_dataset_comparison',
-      content: '<table border="1" class="mock-table"><tr><th>Model</th><th>Accuracy</th></tr><tr><td>Dense Retrieve</td><td>44.2%</td></tr><tr><td>Hybrid (RRF)</td><td>51.8%</td></tr></table>',
-    },
-  ];
+  connectSSE(currentConversationId.value, userText);
+}
 
-  let currentIdx = 0;
-  const interval = setInterval(async () => {
-    if (currentIdx < mockResponse.length) {
-      // Stream characters or tokens
-      streamingText.value += mockResponse.charAt(currentIdx);
-      currentIdx++;
-      await scrollToBottom();
-    } else {
-      clearInterval(interval);
-      streaming.value = false;
-      
-      // Save final message
+function handleSSEEvent(event: string, data: string) {
+  if (event === 'cite') {
+    try {
+      const citation: Citation = JSON.parse(data);
+      citationsBuffer.value.push(citation);
+    } catch (err) {
+      console.error('Failed to parse citation:', err);
+    }
+  } else if (event === 'token') {
+    try {
+      const parsed = JSON.parse(data);
+      streamingText.value += parsed.delta || '';
+      scrollToBottom();
+    } catch (err) {
+      console.error('Failed to parse token:', err);
+    }
+  } else if (event === 'done') {
+    try {
+      const finalContent = processCitationsInText(streamingText.value, citationsBuffer.value);
       messages.value.push({
-        id: Date.now() + 1,
+        id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: streamingText.value,
-        citations: mockCitations,
+        content: finalContent,
+        citations: [...citationsBuffer.value],
       });
       streamingText.value = '';
-      await scrollToBottom();
+      streaming.value = false;
+      scrollToBottom();
+    } catch (err) {
+      console.error('Failed to parse done event:', err);
+      streaming.value = false;
     }
-  }, 15);
+  } else if (event === 'error') {
+    streaming.value = false;
+    alert('连接中断，请稍后重试');
+  }
+}
+
+async function connectSSE(conversationId: string, question: string) {
+  const url = chatAPI.getQuerySSEUrl(conversationId, question);
+  const token = localStorage.getItem('token');
+  abortController = new AbortController();
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        Accept: 'text/event-stream',
+      },
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`SSE connection failed: ${response.status}`);
+    }
+    if (!response.body) {
+      throw new Error('ReadableStream not supported in this browser');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      let currentEvent = '';
+      let currentData = '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          currentData = line.slice(6);
+        } else if (line === '' && currentEvent) {
+          handleSSEEvent(currentEvent, currentData);
+          currentEvent = '';
+          currentData = '';
+        }
+      }
+    }
+  } catch (error: any) {
+    if (error.name !== 'AbortError') {
+      console.error('SSE error:', error);
+      streaming.value = false;
+      alert('连接中断，请稍后重试');
+    }
+  }
+}
+
+// Replace [N] markers with clickable <span> elements that show citation details
+function processCitationsInText(text: string, citations: Citation[]): string {
+  if (!citations.length) return text;
+  return text.replace(/\[(\d+)\]/g, (_match, num) => {
+    const idx = parseInt(num, 10) - 1;
+    if (idx >= 0 && idx < citations.length) {
+      return `<span class="cite-marker" data-cite-idx="${idx}">[${num}]</span>`;
+    }
+    return _match;
+  });
+}
+
+// Event delegation: clicking a [N] marker shows the citation detail in the right panel
+function onMessageClick(e: MouseEvent) {
+  const target = e.target as HTMLElement;
+  if (!target.classList.contains('cite-marker')) return;
+
+  const citeIdx = parseInt(target.dataset.citeIdx || '', 10);
+  if (isNaN(citeIdx)) return;
+
+  const msgEl = target.closest('.message-item') as HTMLElement | null;
+  if (!msgEl || !messageListRef.value) return;
+
+  // Determine which message this citation belongs to
+  // (DOM order mirrors messages array order, and .typing has no clickable markers)
+  const items = messageListRef.value.querySelectorAll(':scope > .message-item');
+  const msgIndex = Array.from(items).indexOf(msgEl);
+  if (msgIndex < 0 || msgIndex >= messages.value.length) return;
+
+  const msg = messages.value[msgIndex];
+  if (!msg.citations || citeIdx >= msg.citations.length) return;
+
+  showCitationDetail(msg.citations[citeIdx]);
 }
 
 async function scrollToBottom() {
@@ -463,6 +594,23 @@ async function scrollToBottom() {
 .message-content {
   font-size: 14px;
   line-height: 1.6;
+}
+
+.message-content :deep(.cite-marker) {
+  display: inline-block;
+  color: #1c7243;
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: none;
+  padding: 0 1px;
+  transition: all 0.2s ease;
+}
+
+.message-content :deep(.cite-marker:hover) {
+  color: #a2f26d;
+  background-color: #0f3d24;
+  border-radius: 3px;
+  text-decoration: underline;
 }
 
 .message-content :deep(strong) {

@@ -1,92 +1,146 @@
-from fastapi import APIRouter, HTTPException
-from typing import List, Optional
-from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from redis import Redis
+from rq import Queue
+
 from app.schemas.ingest import IngestBatchResponse, IngestTaskResponse, TaskRetryResponse
+from common.auth.deps import get_current_user
+from common.config import settings
+from common.db.mysql_client import mysql
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
-# Mock Database for Ingestion Progress
-MOCK_BATCHES = {
-    "batch-782a-4bc3": IngestBatchResponse(
-        batch_id="batch-782a-4bc3",
-        status="completed",
-        total_tasks=1,
-        completed_tasks=1,
-        failed_tasks=0,
-        created_at=datetime.now()
-    ),
-    "batch-591c-99d1": IngestBatchResponse(
-        batch_id="batch-591c-99d1",
-        status="processing",
-        total_tasks=2,
-        completed_tasks=0,
-        failed_tasks=1,
-        created_at=datetime.now()
-    )
-}
 
-MOCK_TASKS = [
-    IngestTaskResponse(
-        id="task-01-attention",
-        paper_id=1,
-        status="completed",
-        stage="completed",
-        progress=100.0,
-        error=None,
-        updated_at=datetime.now()
-    ),
-    IngestTaskResponse(
-        id="task-02-rag-nlp",
-        paper_id=2,
-        status="failed",
-        stage="parsing",
-        progress=45.5,
-        error="MinerU cloud API connection timed out",
-        updated_at=datetime.now()
+def _task_row_to_response(row: Dict[str, Any]) -> IngestTaskResponse:
+    return IngestTaskResponse(
+        id=row["task_id"],
+        paper_id=row["paper_id"],
+        file_name=row.get("file_name"),
+        status=row["status"],
+        stage=row["stage"],
+        progress=float(row.get("progress") or 0),
+        error=row.get("error_msg"),
+        updated_at=row["updated_at"],
     )
-]
+
 
 @router.get("/batches/{batch_id}", response_model=IngestBatchResponse,
             summary="批次解析进度",
             description="查询一次批量上传的整体进度，返回总任务数、已完成数、失败数及状态（processing/completed/failed）。前端上传后轮询此接口。")
-async def get_batch_progress(batch_id: str):
-    if batch_id in MOCK_BATCHES:
-        return MOCK_BATCHES[batch_id]
-    # Dynamically generate progress for new uploads
+async def get_batch_progress(
+    batch_id: str,
+    current=Depends(get_current_user),
+):
+    tasks = await mysql.fetchall(
+        "SELECT status FROM ingest_tasks WHERE batch_id=%s AND user_id=%s",
+        batch_id, current["id"],
+    )
+    if not tasks:
+        raise HTTPException(status_code=404, detail="批次不存在")
+
+    total = len(tasks)
+    completed = sum(1 for t in tasks if t["status"] == "completed")
+    failed = sum(1 for t in tasks if t["status"] == "failed")
+
+    if completed == total:
+        status = "completed"
+    elif failed == total:
+        status = "failed"
+    else:
+        status = "processing"
+
+    # Use the earliest created_at from tasks as the batch created_at
+    first = await mysql.fetchone(
+        "SELECT MIN(created_at) as created_at FROM ingest_tasks WHERE batch_id=%s AND user_id=%s",
+        batch_id, current["id"],
+    )
+
     return IngestBatchResponse(
         batch_id=batch_id,
-        status="processing",
-        total_tasks=3,
-        completed_tasks=1,
-        failed_tasks=0,
-        created_at=datetime.now()
+        status=status,
+        total_tasks=total,
+        completed_tasks=completed,
+        failed_tasks=failed,
+        created_at=first["created_at"] if first else None,
     )
+
 
 @router.get("/tasks", response_model=List[IngestTaskResponse],
             summary="解析任务列表",
-            description="查询单个或所有解析任务的详细状态，包含当前阶段（queued/parsing/indexing/done）、进度百分比和错误信息。可按 `batch_id` 过滤。")
-async def list_tasks(batch_id: Optional[str] = None):
-    # For mock simplicity, we return all tasks or filter by batch_id
-    if batch_id == "batch-782a-4bc3":
-        return [MOCK_TASKS[0]]
-    elif batch_id == "batch-591c-99d1":
-        return [MOCK_TASKS[1]]
-    return MOCK_TASKS
+            description="查询单个或所有解析任务的详细状态，包含当前阶段（queued/parsing/indexing/completed/failed）、进度百分比和错误信息。可按 `batch_id` 过滤。")
+async def list_tasks(
+    batch_id: Optional[str] = None,
+    current=Depends(get_current_user),
+):
+    if batch_id:
+        rows = await mysql.fetchall(
+            "SELECT t.task_id, t.paper_id, t.status, t.stage, t.progress, "
+            "t.error_msg, t.batch_id, t.started_at, t.finished_at, "
+            "t.created_at, t.updated_at, "
+            "p.title AS file_name FROM ingest_tasks t "
+            "LEFT JOIN papers p ON p.id = t.paper_id "
+            "WHERE t.batch_id=%s AND t.user_id=%s ORDER BY t.created_at DESC",
+            batch_id, current["id"],
+        )
+    else:
+        rows = await mysql.fetchall(
+            "SELECT t.task_id, t.paper_id, t.status, t.stage, t.progress, "
+            "t.error_msg, t.batch_id, t.started_at, t.finished_at, "
+            "t.created_at, t.updated_at, "
+            "p.title AS file_name FROM ingest_tasks t "
+            "LEFT JOIN papers p ON p.id = t.paper_id "
+            "WHERE t.user_id=%s ORDER BY t.created_at DESC LIMIT 50",
+            current["id"],
+        )
+    return [_task_row_to_response(r) for r in rows]
+
 
 @router.post("/tasks/{id}/retry", response_model=TaskRetryResponse,
              summary="重试失败任务",
              description="将 `failed` 状态的解析任务重新入队，从头开始解析。任务 stage 重置为 parsing，progress 重置为 0。")
-async def retry_task(id: str):
-    for task in MOCK_TASKS:
-        if task.id == id:
-            task.status = "pending"
-            task.stage = "parsing"
-            task.progress = 0.0
-            task.error = None
-            task.updated_at = datetime.now()
-            return TaskRetryResponse(
-                task_id=id,
-                status="pending",
-                message="Task has been successfully queued for retry."
-            )
-    raise HTTPException(status_code=404, detail="Task not found")
+async def retry_task(
+    id: str,
+    current=Depends(get_current_user),
+):
+    row = await mysql.fetchone(
+        "SELECT * FROM ingest_tasks WHERE task_id=%s AND user_id=%s", id, current["id"]
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    paper = await mysql.fetchone(
+        "SELECT pdf_key FROM papers WHERE id=%s AND user_id=%s",
+        row["paper_id"], current["id"],
+    )
+    if not paper:
+        raise HTTPException(status_code=404, detail="论文不存在")
+
+    # Reset task + paper state (column is error_msg, not error).
+    await mysql.execute(
+        "UPDATE ingest_tasks SET status='pending', stage='queued', progress=0, "
+        "error_msg=NULL, started_at=NULL, finished_at=NULL "
+        "WHERE task_id=%s AND user_id=%s",
+        id, current["id"],
+    )
+    await mysql.execute(
+        "UPDATE papers SET status='pending' WHERE id=%s AND user_id=%s",
+        row["paper_id"], current["id"],
+    )
+
+    # Re-enqueue the RQ job so the pipeline actually re-runs.
+    redis_conn = Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_DB)
+    rq_queue = Queue("ingest", connection=redis_conn)
+    rq_queue.enqueue(
+        "app.worker.main.handle_ingest_job",
+        user_id=current["id"],
+        paper_id=row["paper_id"],
+        pdf_key=paper["pdf_key"],
+        task_id=id,
+    )
+
+    return TaskRetryResponse(
+        task_id=id,
+        status="pending",
+        message="任务已重新入队",
+    )

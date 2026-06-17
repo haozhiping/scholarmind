@@ -6,9 +6,14 @@ class QueryLogResponse(BaseModel):
     id: int
     user_id: int
     question: str
-    answer_snippet: str
-    latency_ms: int
-    tokens_used: int
+    answer_snippet: Optional[str] = None   # query_logs 不存储完整答案
+    rewritten_query: Optional[str] = None
+    latency_ms: Optional[int] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    tokens_used: Optional[int] = None       # prompt_tokens + completion_tokens
+    retrieved_chunk_ids: Optional[List] = None  # JSON 数组，兼容 int/str
+    feedback: Optional[int] = None           # 1=赞, -1=踩, NULL=无
     created_at: datetime
 
 class AccessLogResponse(BaseModel):
@@ -17,7 +22,8 @@ class AccessLogResponse(BaseModel):
     path: str
     method: str
     status_code: int
-    ip_address: str
+    ip_address: Optional[str] = None    # DB 列名是 ip
+    latency_ms: Optional[int] = None   # 来自 access_logs 表
     created_at: datetime
 
 class StatsOverviewResponse(BaseModel):

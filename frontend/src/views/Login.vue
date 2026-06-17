@@ -67,7 +67,7 @@
 import { ref, reactive } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
-// import api from '../api';
+import { authAPI } from '../api';
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -88,21 +88,25 @@ async function handleSubmit() {
   
   try {
     if (isLogin.value) {
-      // Simulate API call for login
-      // const res = await api.post('/api/auth/login', { username: form.username, password: form.password });
-      // authStore.setToken(res.data.access_token);
-      
-      // Temporary mock token for skeleton
-      authStore.setToken('mock-jwt-token-scholarmind');
+      // Login API call
+      const res = await authAPI.login(form.username, form.password);
+      authStore.setToken(res.data.access_token);
+      // Fetch user info after login
+      try {
+        const userRes = await authAPI.getMe();
+        authStore.setUser(userRes.data);
+      } catch (_) {
+        // Non-critical: user info fetch failed
+      }
       router.push('/library');
     } else {
-      // Simulate API call for register
-      // await api.post('/api/auth/register', form);
+      // Register API call
+      await authAPI.register(form.username, form.email, form.password);
       isLogin.value = true;
       errorMsg.value = '注册成功，请使用新账号登录！';
     }
   } catch (error: any) {
-    errorMsg.value = error.response?.data?.detail || '操作失败，请稍后重试';
+    errorMsg.value = error.response?.data?.error || error.response?.data?.detail || error.message || '操作失败，请稍后重试';
   } finally {
     loading.value = false;
   }

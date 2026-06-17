@@ -5,7 +5,7 @@ All providers (qwen, deepseek, openai, dashscope) share the same interface.
 import asyncio
 import json
 import re
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 from openai import AsyncOpenAI
@@ -76,6 +76,90 @@ async def chat_complete_json(prompt: str, **kwargs) -> Any:
         # Strip markdown code fences if present
         cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
         return json.loads(cleaned)
+
+
+# ---------------------------------------------------------------------------
+# AsyncLLMClient (class-based wrapper for chat services)
+# ---------------------------------------------------------------------------
+
+class AsyncLLMClient:
+    """Unified async client for LLM chat completion (streaming + non-streaming).
+
+    Wraps the module-level ``chat_complete`` style into an injectable class
+    so that ChatService / IntentRouter can hold a persistent client instance.
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ):
+        self.base_url = base_url or settings.LLM_BASE_URL
+        self.api_key = api_key or settings.LLM_API_KEY
+        self.model = model or settings.LLM_MODEL
+        self.temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
+        self.max_tokens = max_tokens or settings.LLM_MAX_TOKENS
+
+    def _client(self) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=120,
+            max_retries=2,
+        )
+
+    # -- non-streaming -------------------------------------------------------
+
+    async def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        json_mode: bool = False,
+    ) -> str:
+        """Send a full message list and return the complete response text."""
+        client = self._client()
+        kwargs: dict[str, Any] = {
+            "model": model or self.model,
+            "messages": messages,
+            "temperature": temperature if temperature is not None else self.temperature,
+            "max_tokens": max_tokens or self.max_tokens,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        resp = await client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
+
+    # -- streaming -----------------------------------------------------------
+
+    async def stream_chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream tokens from the LLM, yielding content strings."""
+        client = self._client()
+        kwargs: dict[str, Any] = {
+            "model": model or self.model,
+            "messages": messages,
+            "temperature": temperature if temperature is not None else self.temperature,
+            "max_tokens": max_tokens or self.max_tokens,
+            "stream": True,
+        }
+        stream = await client.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +237,7 @@ async def rerank(query: str, documents: list[str], top_n: int | None = None) -> 
 async def _rerank_dashscope(query: str, documents: list[str], top_n: int) -> list[dict]:
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            f"{settings.RERANK_BASE_URL}/rerank",
+            settings.RERANK_BASE_URL,
             headers={
                 "Authorization": f"Bearer {settings.RERANK_API_KEY}",
                 "Content-Type": "application/json",

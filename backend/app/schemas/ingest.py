@@ -13,6 +13,7 @@ class IngestBatchResponse(BaseModel):
 class IngestTaskResponse(BaseModel):
     id: str
     paper_id: int
+    file_name: Optional[str] = None
     status: str  # "pending", "parsing", "indexing", "completed", "failed"
     stage: str  # "parsing", "indexing", "completed", "failed"
     progress: float  # 0.0 to 100.0

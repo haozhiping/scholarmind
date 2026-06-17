@@ -30,7 +30,7 @@
         <h1>论文文献库</h1>
         <div class="user-profile">
           <span class="avatar">👤</span>
-          <span class="username">项目成员</span>
+          <span class="username">{{ authStore.user?.username || '项目成员' }}</span>
         </div>
       </header>
 
@@ -105,7 +105,7 @@
               <tbody>
                 <tr v-for="paper in filteredPapers" :key="paper.id">
                   <td class="paper-title" @click="openPaper(paper)">{{ paper.title }}</td>
-                  <td>{{ paper.authors?.join(', ') || '未知' }}</td>
+                  <td>{{ Array.isArray(paper.authors) ? paper.authors.join(', ') : paper.authors || '未知' }}</td>
                   <td>{{ paper.year || '-' }}</td>
                   <td>
                     <span :class="['status-badge', paper.status]">
@@ -174,9 +174,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick } from 'vue';
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import { papersAPI, foldersAPI, ingestAPI } from '../api';
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -188,6 +189,13 @@ interface Paper {
   year?: number;
   status: string;
   created_at: string;
+  batch_id?: string;
+}
+
+interface Folder {
+  id: number;
+  name: string;
+  paper_count?: number;
 }
 
 const isDragging = ref(false);
@@ -206,50 +214,114 @@ const confirmModal = ref({
   onConfirm: null as (() => void) | null
 });
 
-function triggerFileSelect() {
-  fileInput.value?.click();
-}
+const loading = ref(false);
+const uploadProgress = ref<Record<number, number>>({});
 
 const statusMap: Record<string, string> = {
   pending: '排队中',
   parsing: '解析中',
   indexing: '索引中',
+  completed: '就绪',
   done: '就绪',
   failed: '失败',
 };
 
-const folders = ref([
-  { id: 1, name: '大语言模型 (LLM)' },
-  { id: 2, name: '多模态与 VLM' },
-  { id: 3, name: 'RAG 检索增强生成' },
-]);
-
-const papers = ref<Paper[]>([
-  {
-    id: 1,
-    title: 'Attention Is All You Need',
-    authors: ['Vaswani et al.'],
-    year: 2017,
-    status: 'done',
-    created_at: '2026-06-03 10:00:00',
-  },
-  {
-    id: 2,
-    title: 'Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks',
-    authors: ['Lewis et al.'],
-    year: 2020,
-    status: 'parsing',
-    created_at: '2026-06-03 12:30:00',
-  },
-]);
+const folders = ref<Folder[]>([]);
+const papers = ref<Paper[]>([]);
+const currentBatchId = ref<string | null>(null);
 
 const filteredPapers = computed(() => {
   return papers.value.filter(paper => {
     const matchesSearch = paper.title.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
-      paper.authors.some(auth => auth.toLowerCase().includes(searchQuery.value.toLowerCase()));
+      paper.authors.some((auth: string) => auth.toLowerCase().includes(searchQuery.value.toLowerCase()));
     return matchesSearch;
   });
 });
+
+function triggerFileSelect() {
+  fileInput.value?.click();
+}
+
+// Polling management
+let pollIntervalId: ReturnType<typeof setInterval> | null = null;
+const TERMINAL_STATUSES = new Set(['done', 'completed', 'failed']);
+
+function allPapersTerminal(): boolean {
+  return papers.value.length > 0 && papers.value.every(p => TERMINAL_STATUSES.has(p.status));
+}
+
+function startPolling() {
+  stopPolling(); // ensure no duplicate intervals
+  pollIntervalId = setInterval(async () => {
+    if (currentBatchId.value) {
+      await loadPapers();
+      // Stop when every paper has reached a terminal state
+      if (allPapersTerminal()) {
+        stopPolling();
+      }
+    }
+  }, 3000);
+}
+
+function stopPolling() {
+  if (pollIntervalId !== null) {
+    clearInterval(pollIntervalId);
+    pollIntervalId = null;
+  }
+  currentBatchId.value = null;
+}
+
+// Load folders and papers on mount
+onMounted(async () => {
+  await loadFolders();
+  await loadPapers();
+  startPolling();
+});
+
+onUnmounted(() => {
+  stopPolling();
+});
+
+// Reload papers when folder selection changes
+watch(selectedFolderId, () => {
+  loadPapers();
+});
+
+async function loadFolders() {
+  try {
+    const res = await foldersAPI.listFolders();
+    folders.value = res.data;
+  } catch (error: any) {
+    console.error('Failed to load folders:', error);
+  }
+}
+
+async function loadPapers() {
+  try {
+    loading.value = true;
+    const res = await papersAPI.listPapers(
+      selectedFolderId.value ?? undefined
+    );
+    papers.value = res.data.map((paper: any) => ({
+      id: paper.id,
+      title: paper.title,
+      authors: paper.authors ? (typeof paper.authors === 'string' ? paper.authors.split(', ').filter(Boolean) : Array.isArray(paper.authors) ? paper.authors : [paper.authors]) : ['未知'],
+      year: paper.year,
+      status: paper.status,
+      created_at: new Date(paper.created_at).toLocaleString('zh-CN'),
+      batch_id: paper.batch_id,
+    }));
+    
+    // Update batch_id for polling
+    if (papers.value.length > 0 && papers.value[0].batch_id) {
+      currentBatchId.value = papers.value[0].batch_id;
+    }
+  } catch (error: any) {
+    console.error('Failed to load papers:', error);
+  } finally {
+    loading.value = false;
+  }
+}
 
 function handleLogout() {
   authStore.clearAuth();
@@ -263,14 +335,19 @@ async function createFolder() {
   newFolderInputRef.value?.focus();
 }
 
-function submitCreateFolder() {
+async function submitCreateFolder() {
   const name = newFolderName.value.trim();
   if (name) {
-    folders.value.push({
-      id: Date.now(),
-      name: name,
-    });
-    showCreateFolderModal.value = false;
+    try {
+      const res = await foldersAPI.createFolder(name);
+      folders.value.push({
+        id: res.data.id,
+        name: res.data.name,
+      });
+      showCreateFolderModal.value = false;
+    } catch (error: any) {
+      console.error('Failed to create folder:', error);
+    }
   }
 }
 
@@ -279,10 +356,16 @@ function confirmDeleteFolder(folder: { id: number; name: string }) {
     show: true,
     title: "🗑️ 删除文献文件夹",
     message: `确定要删除文件夹 "${folder.name}" 吗？删除该文件夹不会删除其中的文献，文献将被归类到未分类中。`,
-    onConfirm: () => {
-      folders.value = folders.value.filter(f => f.id !== folder.id);
-      if (selectedFolderId.value === folder.id) {
-        selectedFolderId.value = null;
+    onConfirm: async () => {
+      try {
+        await foldersAPI.deleteFolder(folder.id);
+        folders.value = folders.value.filter(f => f.id !== folder.id);
+        if (selectedFolderId.value === folder.id) {
+          selectedFolderId.value = null;
+        }
+        await loadFolders();
+      } catch (error: any) {
+        console.error('Failed to delete folder:', error);
       }
     }
   };
@@ -303,17 +386,44 @@ function handleFileSelect(e: Event) {
   }
 }
 
-function uploadFiles(files: FileList) {
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    papers.value.push({
-      id: Date.now() + i,
-      title: file.name.replace('.pdf', ''),
-      authors: ['待解析'],
-      year: undefined,
-      status: 'pending',
-      created_at: new Date().toISOString().replace('T', ' ').substring(0, 19),
+async function uploadFiles(files: FileList) {
+  try {
+    loading.value = true;
+    const res = await papersAPI.uploadPapers(files, selectedFolderId.value ?? undefined);
+    
+    // Store batch_id for polling & restart polling
+    currentBatchId.value = res.data.batch_id;
+    startPolling();
+    
+    // Show upload success
+    alert(`已上传 ${files.length} 个文件，正在后台解析中...`);
+    
+    // Reload papers to show new uploads
+    await loadPapers();
+  } catch (error: any) {
+    console.error('Failed to upload papers:', error);
+    console.error('Upload error details:', {
+      code: error?.code,
+      message: error?.message,
+      hasResponse: !!error?.response,
+      status: error?.response?.status,
+      statusText: error?.response?.statusText,
+      responseData: error?.response?.data,
+      fileName: files[0]?.name,
+      fileSize: files[0]?.size,
     });
+    if (error?.code === 'ECONNABORTED') {
+      alert('上传超时，PDF 文件过大或网络较慢，请重试');
+    } else if (error?.code === 'ERR_NETWORK') {
+      alert('网络错误，请检查后端服务是否正常运行（localhost:8008）');
+    } else if (error?.code === 'ERR_BAD_RESPONSE') {
+      alert('服务器响应异常，请查看后端日志');
+    } else {
+      const detail = error?.response?.data?.detail || error?.message || '未知错误';
+      alert(`上传失败：${detail}`);
+    }
+  } finally {
+    loading.value = false;
   }
 }
 
@@ -323,8 +433,14 @@ function deletePaper(id: number) {
     show: true,
     title: "🗑️ 删除文献",
     message: "确认删除此文献吗？其对应的向量与解析内容均将被彻底清理，不可恢复。",
-    onConfirm: () => {
-      papers.value = papers.value.filter(p => p.id !== id);
+    onConfirm: async () => {
+      try {
+        await papersAPI.deletePaper(id);
+        papers.value = papers.value.filter(p => p.id !== id);
+      } catch (error: any) {
+        console.error('Failed to delete paper:', error);
+        alert('删除失败，请稍后重试');
+      }
     }
   };
 }
@@ -663,7 +779,7 @@ td {
   font-weight: 600;
 }
 
-.status-badge.done {
+.status-badge.done, .status-badge.completed {
   background-color: #d1f2d9;
   color: #0f6c2c;
 }

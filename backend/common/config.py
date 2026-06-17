@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     MILVUS_COLLECTION: str = "scholarmind_chunks"
     MILVUS_INDEX_TYPE: str = "HNSW"
     MILVUS_METRIC: str = "COSINE"
+    MILVUS_M: int = 16                    # HNSW M parameter
+    MILVUS_EF_CONSTRUCTION: int = 200     # ef during construction
+    MILVUS_EF_SEARCH: int = 64            # ef during search
+    MILVUS_BATCH_SIZE: int = 100          # bulk insert batch size
 
     # MySQL
     MYSQL_HOST: str = "mysql"
@@ -85,6 +89,23 @@ class Settings(BaseSettings):
     # Reference parser provider: llm (default, no extra container) | grobid (high accuracy, needs grobid ~4GB image)
     REFERENCE_PARSER_PROVIDER: str = "llm"
     GROBID_BASE_URL: str = "http://grobid:8070"
+
+    # MinerU 解析器选择: "agent" (轻量 Agent API, 默认) | "kie" (KIE SDK, 需 Pipeline ID)
+    MINERU_PROVIDER: str = "agent"
+
+    # MinerU Agent 轻量解析 API (https://mineru.net/api/v1/agent)
+    MINERU_AGENT_BASE_URL: str = "https://mineru.net/api/v1/agent"
+    MINERU_API_KEY: str = ""              # 未使用：Agent 轻量 API 免登录、无需 Token；保留字段以兼容标准 API/旧配置
+    MINERU_LANGUAGE: str = "ch"           # 文档语言: ch / en
+    MINERU_ENABLE_TABLE: bool = True
+    MINERU_ENABLE_FORMULA: bool = True
+    MINERU_IS_OCR: bool = False
+
+    # MinerU KIE cloud SDK (mineru-kie-sdk, 需要 Pipeline ID)
+    MINERU_KIE_BASE_URL: str = "https://mineru.net/api/kie"
+    MINERU_PIPELINE_ID: str = ""          # required for cloud parsing
+    MINERU_POLL_INTERVAL: int = 5         # seconds between polls
+    MINERU_TIMEOUT: int = 300             # total poll timeout (s); -1 = until done
 
     # Retrieval
     RETRIEVAL_TOP_K: int = 20

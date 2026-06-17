@@ -32,22 +32,40 @@
 
       <div class="content-body">
         <!-- Overview Stats Grid -->
-        <div class="metrics-grid">
+        <div class="metrics-grid" v-if="stats">
           <div class="metric-card">
             <span class="metric-title">📁 知识库文档数</span>
-            <div class="metric-val">12 <span class="sub">篇</span></div>
+            <div class="metric-val">{{ stats.paper_count }} <span class="sub">篇</span></div>
           </div>
           <div class="metric-card">
             <span class="metric-title">🧩 已构建向量分块</span>
-            <div class="metric-val">3,248 <span class="sub">个</span></div>
+            <div class="metric-val">{{ stats.chunk_count.toLocaleString() }} <span class="sub">个</span></div>
           </div>
           <div class="metric-card">
             <span class="metric-title">⚡ 平均问答延迟</span>
-            <div class="metric-val">420 <span class="sub">ms</span></div>
+            <div class="metric-val">{{ Math.round(stats.average_latency_ms) }} <span class="sub">ms</span></div>
           </div>
           <div class="metric-card">
-            <span class="metric-title">💾 Redis 缓存命中率</span>
-            <div class="metric-val">78.5 <span class="sub">%</span></div>
+            <span class="metric-title">💾 历史查询总次数</span>
+            <div class="metric-val">{{ stats.total_queries.toLocaleString() }} <span class="sub">次</span></div>
+          </div>
+        </div>
+        <div class="metrics-grid" v-else>
+          <div class="metric-card">
+            <span class="metric-title">📁 知识库文档数</span>
+            <div class="metric-val">- <span class="sub">篇</span></div>
+          </div>
+          <div class="metric-card">
+            <span class="metric-title">🧩 已构建向量分块</span>
+            <div class="metric-val">- <span class="sub">个</span></div>
+          </div>
+          <div class="metric-card">
+            <span class="metric-title">⚡ 平均问答延迟</span>
+            <div class="metric-val">- <span class="sub">ms</span></div>
+          </div>
+          <div class="metric-card">
+            <span class="metric-title">💾 历史查询总次数</span>
+            <div class="metric-val">- <span class="sub">次</span></div>
           </div>
         </div>
 
@@ -117,9 +135,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import { observabilityAPI } from '../api';
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -129,50 +148,121 @@ const stageMap: Record<string, string> = {
   parsing: '版面解析中 (MinerU/GROBID)',
   indexing: '向量索引构建中',
   done: '处理完毕',
+  completed: '处理完毕',
   failed: '任务失败',
 };
 
-const activeTasks = ref([
-  {
-    id: 1,
-    file_name: 'Retrieval-Augmented Generation for NLP Tasks.pdf',
-    stage: 'parsing',
-    progress: 45,
-    started_at: '2026-06-03 21:20:00',
-    error_msg: null,
-  },
-  {
-    id: 2,
-    file_name: 'BGE M3 Embedding Model Paper.pdf',
-    stage: 'queued',
-    progress: 0,
-    started_at: '2026-06-03 21:28:10',
-    error_msg: null,
-  },
-]);
+interface Task {
+  id: string;
+  file_name: string;
+  stage: string;
+  progress: number;
+  started_at: string;
+  error_msg?: string | null;
+}
 
-const queryLogs = ref([
-  {
-    id: 101,
-    question: 'Transformer的多头注意力是什么作用？',
-    rewritten_query: 'Transformer multi-head attention mechanism function and purpose',
-    latency_ms: 380,
-    prompt_tokens: 1540,
-    completion_tokens: 320,
-    retrieved_chunk_ids: [12, 15, 23],
-    feedback: 1,
-  },
-  {
-    id: 102,
-    question: '混合检索在 Milvus 里面怎么弄？',
-    rewritten_query: 'How to implement hybrid dense and sparse search in Milvus vector database',
-    latency_ms: 450,
-    prompt_tokens: 1820,
-    completion_tokens: 280,
-    retrieved_chunk_ids: [48, 51],
-    feedback: undefined,
-  },
-]);
+interface QueryLog {
+  id: number;
+  question: string;
+  rewritten_query?: string;
+  latency_ms: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  retrieved_chunk_ids: number[];
+  feedback?: number;
+}
+
+interface Stats {
+  paper_count: number;
+  chunk_count: number;
+  total_queries: number;
+  average_latency_ms: number;
+}
+
+const activeTasks = ref<Task[]>([]);
+const queryLogs = ref<QueryLog[]>([]);
+const stats = ref<Stats | null>(null);
+
+// Polling management
+let tasksPollId: ReturnType<typeof setInterval> | null = null;
+let statsPollId: ReturnType<typeof setInterval> | null = null;
+
+function startPolling() {
+  stopPolling();
+  // 入库任务进度条：3 秒刷新（高频变化）
+  tasksPollId = setInterval(() => {
+    loadActiveTasks();
+  }, 3000);
+  // 统计卡片：30 秒刷新（低频变化）
+  statsPollId = setInterval(() => {
+    loadStats();
+  }, 30000);
+}
+
+function stopPolling() {
+  if (tasksPollId !== null) {
+    clearInterval(tasksPollId);
+    tasksPollId = null;
+  }
+  if (statsPollId !== null) {
+    clearInterval(statsPollId);
+    statsPollId = null;
+  }
+}
+
+onMounted(async () => {
+  await loadStats();
+  await loadActiveTasks();
+  await loadQueryLogs();
+  startPolling();
+});
+
+onUnmounted(() => {
+  stopPolling();
+});
+
+async function loadStats() {
+  try {
+    const res = await observabilityAPI.getStatsOverview();
+    stats.value = res.data;
+  } catch (error: any) {
+    console.error('Failed to load stats:', error);
+  }
+}
+
+async function loadActiveTasks() {
+  try {
+    const res = await observabilityAPI.getActiveTasks();
+    activeTasks.value = res.data.map((task: any) => ({
+      id: task.id,
+      file_name: task.file_name || task.id,
+      stage: task.stage,
+      progress: task.progress || 0,
+      started_at: new Date(task.updated_at || Date.now()).toLocaleString('zh-CN'),
+      error_msg: task.error || null,
+    }));
+  } catch (error: any) {
+    console.error('Failed to load active tasks:', error);
+  }
+}
+
+async function loadQueryLogs() {
+  try {
+    const res = await observabilityAPI.getQueryLogs(10, 0);
+    queryLogs.value = res.data.map((log: any) => ({
+      id: log.id,
+      question: log.question,
+      rewritten_query: log.rewritten_query || null,
+      latency_ms: log.latency_ms,
+      prompt_tokens: log.prompt_tokens || log.tokens_used || 0,
+      completion_tokens: log.completion_tokens || 0,
+      retrieved_chunk_ids: log.retrieved_chunk_ids || [],
+      feedback: log.feedback || 0,
+    }));
+  } catch (error: any) {
+    console.error('Failed to load query logs:', error);
+  }
+}
 
 function handleLogout() {
   authStore.clearAuth();

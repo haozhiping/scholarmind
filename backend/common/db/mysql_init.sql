@@ -1,4 +1,9 @@
 -- MySQL schema initialization for ScholarMind
+--
+-- 初始化后请运行种子脚本创建默认管理员:
+--   cd backend && python -m common.db.seed
+--   # 或重置密码: python -m common.db.seed --reset
+-- 默认管理员: admin / admin123
 
 CREATE TABLE IF NOT EXISTS users (
   id            BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -48,6 +53,7 @@ CREATE TABLE IF NOT EXISTS doc_blocks (
   user_id     BIGINT NOT NULL,
   block_type  VARCHAR(16) NOT NULL,               -- text|table|figure|formula
   content     LONGTEXT NULL,                       -- table->HTML, formula->LaTeX, figure->caption
+  content_zh  TEXT NULL,                            -- VLM 中文图描述（figure blocks only）
   page_num    INT NULL,
   bbox        JSON NULL,                           -- [page,left,top,right,bottom]
   image_key   VARCHAR(256) NULL,
@@ -79,18 +85,22 @@ CREATE TABLE IF NOT EXISTS ingest_batches (
 
 CREATE TABLE IF NOT EXISTS ingest_tasks (
   id          BIGINT PRIMARY KEY AUTO_INCREMENT,
-  batch_id    BIGINT NULL,
+  task_id     VARCHAR(64) NOT NULL UNIQUE,            -- UUID string for API reference
+  batch_id    VARCHAR(64) NULL,                       -- batch UUID string
   user_id     BIGINT NOT NULL,
   paper_id    BIGINT NULL,
-  file_name   VARCHAR(256) NOT NULL,
-  file_hash   CHAR(16) NOT NULL,
-  stage       VARCHAR(16) NOT NULL DEFAULT 'queued', -- queued|parsing|indexing|done|failed
+  file_name   VARCHAR(256) NULL,
+  file_hash   CHAR(16) NOT NULL DEFAULT '',
+  stage       VARCHAR(16) NOT NULL DEFAULT 'queued', -- queued|parsing|indexing|completed|failed
+  status      VARCHAR(16) NOT NULL DEFAULT 'pending', -- pending|processing|completed|failed
   progress    TINYINT NOT NULL DEFAULT 0,
   error_msg   TEXT NULL,
   retry_count INT NOT NULL DEFAULT 0,
   started_at  DATETIME NULL,
   finished_at DATETIME NULL,
   created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_task_taskid (task_id),
   INDEX idx_task_batch (batch_id),
   INDEX idx_task_user_stage (user_id, stage)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
